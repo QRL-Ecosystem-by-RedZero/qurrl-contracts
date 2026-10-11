@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Primary issuance of Qurrl, one row per ecosystem phase (QuantumArk-Phases.md §5).
+ *
+ * Phase 0 is a whitelist the deployer sets once. From phase 1 two pools run side by
+ * side in the phase's mint window: the Acorn pool, paid by spending Acorn points, and
+ * the QRL pool, paid in native QRL. Every row is fixed at deployment; the owner tunes
+ * the current phase's points price and QRL fee inside bounds, and governance amends a
+ * row by keyed compare-and-swap.
+ */
+interface IQurrlPhaseMinter {
+    struct PhaseRow {
+        /// Phase 0: the whitelist allocation. Later phases: the Acorn pool.
+        uint32 acornCap;
+        uint32 qrlCap;
+        uint32 fusionCap;
+        /// Acorn points spent per token in the Acorn pool, and the owner's bounds on it.
+        uint32 reqPts;
+        uint32 reqPtsMin;
+        uint32 reqPtsMax;
+        /// QRL pool price per token, and the owner's bounds on it.
+        uint128 mintFee;
+        uint128 mintFeeMin;
+        uint128 mintFeeMax;
+        uint128 fusionFee;
+        /// QRL pool tokens per wallet in this phase; 0 means unlimited.
+        uint16 walletLimit;
+        /// Seconds the mint window lasts, cut short at the season's reveal.
+        uint32 mintDuration;
+        /// Seconds the fusion window lasts from the season's reveal.
+        uint32 fusionDuration;
+        /// QRL for the first paid trait lock of a fusion in this phase; governance may set it
+        /// for any phase that has not opened.
+        uint128 lockBaseFee;
+    }
+
+    /// Same shape as IArkStakeGovernable.ParamChange; the key is `QurrlPhaseMinter.keyOf(field, phase)`.
+    struct ParamChange {
+        bytes32 key;
+        uint256 expected;
+        uint256 value;
+    }
+
+    event GenesisSet(bytes32 root, uint16 perWallet);
+    event PhaseOpened(uint8 indexed phase, uint16 indexed seasonId, uint64 closesAt, uint64 fusionOpensAt);
+    event GenesisMinted(address indexed account, uint32 quantity);
+    event AcornMinted(address indexed account, uint32 quantity, uint64 pointsSpent);
+    event QrlMinted(address indexed account, uint32 quantity, uint256 paid);
+    event AcornRootPosted(uint64 indexed epoch, bytes32 root);
+    event ReqPtsSet(uint8 indexed phase, uint32 previous, uint32 next);
+    event MintFeeSet(uint8 indexed phase, uint128 previous, uint128 next);
+    event ParamChanged(bytes32 indexed key, uint256 previous, uint256 next);
+    event OwnerSet(address owner);
+    event AcornOracleSet(address oracle);
+    event GovernanceProposed(address next);
+    event GovernanceAccepted(address governance);
+
+    function openPhase() external returns (uint16 seasonId);
+
+    function mintGenesis(uint32 quantity, bytes32[] calldata proof) external;
+
+    function mintAcorn(uint32 quantity, uint64 earned, bytes32[] calldata proof) external;
+
+    function mintQrl(uint32 quantity) external payable;
+
+    function rowOf(uint8 phase) external view returns (PhaseRow memory);
+
+    /// The phase whose season is the collection's latest; `opened` is false before phase 0 opens.
+    function currentPhase() external view returns (bool opened, uint8 phase);
+}

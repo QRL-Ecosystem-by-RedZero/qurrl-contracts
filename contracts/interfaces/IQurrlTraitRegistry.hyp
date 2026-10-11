@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Trait palette and per-season reveal seeds.
+ *
+ * Traits are never written at mint time. They are derived from a seed the
+ * curator committed to *before* the season opened, mixed with entropy that
+ * exists only in the block that reveals it, which is what stops the curator,
+ * the minter and anyone watching the mempool from grinding for a rare pull.
+ *
+ * The registry knows trait SLOTS and VARIANT INDICES only. It holds no names:
+ * what a slot or a variant is called, and what it looks like, lives off chain
+ * and is not published until the art is (see CLAUDE.md "Trait confidentiality").
+ *
+ * Every declaration here is backed by an explicit view function in the
+ * implementation rather than by a public state variable, so no getter has to
+ * override an interface function.
+ */
+interface IQurrlTraitRegistry {
+    /// Variant count per slot, ordered by slot. Frozen before any season opens.
+    function palette() external view returns (uint8[6] memory);
+
+    /// Probability of each variant in `slot`, in basis points summing to 10,000.
+    function weightsOf(uint256 slot) external view returns (uint16[] memory);
+
+    /// Hash of the off-chain trait manifest; bytes32(0) until committed.
+    function manifestOf() external view returns (bytes32);
+
+    function paletteFrozen() external view returns (bool);
+
+    function hasCommitment(uint16 seasonId) external view returns (bool);
+
+    function isRevealed(uint16 seasonId) external view returns (bool);
+
+    function commitmentOf(uint16 seasonId) external view returns (bytes32);
+
+    /// The earliest time the season may be revealed; the NFT checks it against `closesAt`.
+    function revealNotBeforeOf(uint16 seasonId) external view returns (uint64);
+
+    /// The seed traits are actually derived from; bytes32(0) until revealed.
+    function seedOf(uint16 seasonId) external view returns (bytes32);
+
+    /**
+     * Deterministic trait vector for a token in a revealed season.
+     * Reverts while the season seed is still sealed.
+     */
+    function deriveTraits(uint16 seasonId, uint256 tokenId) external view returns (uint8[6] memory);
+
+    event PaletteUpdated(uint256 indexed slot, uint8 variantCount);
+    event PaletteSealed(uint256 timestamp);
+    event ManifestCommitted(bytes32 manifestHash);
+    event SeedCommitted(uint16 indexed seasonId, bytes32 commitment, uint64 revealNotBefore);
+    event SeedRevealed(uint16 indexed seasonId, bytes32 curatorSeed, bytes32 entropy, bytes32 effectiveSeed, bool defaulted);
+}

@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * File-level custom errors shared by every Qurrl contract.
+ *
+ * File-level errors keep duplicated revert-string data out of the deployed
+ * bytecode, which matters more on Zond than on Ethereum: an ML-DSA-87
+ * signature plus public key adds ~7.2KB to every transaction, so creation code
+ * above ~18KB can no longer be deployed in a single request.
+ */
+
+/// A zero address was supplied where a live account or contract is required.
+error ZeroAddress();
+
+/// A mint or fusion was requested for zero tokens.
+error ZeroQuantity();
+
+/// The 10,500 lifetime issuance ceiling has been reached.
+error MaxSupplyReached(uint256 cap);
+
+/// The season has never been configured.
+error SeasonNotConfigured(uint16 seasonId);
+
+/// Seasons are append-only; the supplied id is not the next one.
+error SeasonOutOfOrder(uint16 expected, uint16 provided);
+
+/// A season that has already opened can no longer be retuned.
+error SeasonLocked(uint16 seasonId);
+
+/// `block.timestamp` is outside the season's mint window.
+error SeasonNotOpen(uint16 seasonId);
+
+/// The season's primary allocation is exhausted.
+error SeasonSoldOut(uint16 seasonId);
+
+/// `closesAt` is not strictly after `opensAt`.
+error InvalidWindow(uint64 opensAt, uint64 closesAt);
+
+/// Configuring this season would push allocated supply past the lifetime cap.
+error AllocationExceeded(uint256 allocated, uint256 cap);
+
+/// The caller already holds its per-wallet allocation for this phase.
+error WalletLimitReached(uint32 limit, uint32 minted);
+
+/// The native value attached to the call does not match the tariff.
+error IncorrectPayment(uint256 required, uint256 provided);
+
+/// The supplied Merkle proof does not reconstruct the expected root.
+error InvalidMerkleProof();
+
+/// Fusion is not enabled for the active season.
+error FusionDisabled(uint16 seasonId);
+
+/// A fusion window may not open before the season's reveal.
+error FusionBeforeReveal(uint16 seasonId, uint64 revealNotBefore, uint64 fusionOpensAt);
+
+/// The season's fusion allocation is exhausted.
+error FusionBudgetExhausted(uint16 seasonId);
+
+/// A token cannot be fused with itself.
+error IdenticalTokens(uint256 tokenId);
+
+/// The caller neither owns the token nor is approved for it.
+error NotTokenHolder(uint256 tokenId, address caller);
+
+/// The token's season seed has not been revealed, so its traits do not exist yet.
+error TraitsNotRevealed(uint16 seasonId);
+
+/// The queried token identifier has never been minted, or has been fused away.
+error UnknownToken(uint256 tokenId);
+
+/// A season seed commitment is write-once.
+error SeedAlreadyCommitted(uint16 seasonId);
+
+/// No commitment exists for the season, so nothing can be revealed against it.
+error SeedNotCommitted(uint16 seasonId);
+
+/// The season seed has already been revealed and is now immutable.
+error SeedAlreadyRevealed(uint16 seasonId);
+
+/// The revealed seed does not hash to the stored commitment.
+error SeedMismatch(bytes32 commitment);
+
+/// The trait palette is frozen and can no longer be edited.
+error PaletteFrozen();
+
+/// The trait palette must be frozen before any season may be configured.
+error PaletteNotFrozen();
+
+/// The trait slot index is outside 0..TRAIT_SLOTS-1.
+error UnknownTraitSlot(uint256 slot);
+
+/// A trait category must offer at least one variant.
+error InvalidVariantCount(uint256 slot);
+
+/// A native value transfer failed at the recipient.
+error TransferFailed(address recipient, uint256 amount);
+
+/// The treasury holds no balance to withdraw.
+error NothingToWithdraw();
+
+/// The royalty rate exceeds the 5% ceiling.
+error RoyaltyOutOfRange(uint16 bps);
+
+/// A slot's weights are zero somewhere, or do not sum to 10,000.
+error InvalidWeights(uint256 slot);
+
+/// `revealNotBefore` must be in the future when the seed is committed.
+error RevealTimeInvalid(uint64 revealNotBefore);
+
+/// The season may not be revealed before `notBefore`.
+error RevealTooEarly(uint16 seasonId, uint64 notBefore);
+
+/// A season window closes after the moment its seed may be revealed.
+error RevealBeforeClose(uint16 seasonId, uint64 revealNotBefore, uint64 closesAt);
+
+/// The curator's reveal window has passed; the season can only be defaulted now.
+error RevealWindowClosed(uint16 seasonId);
+
+/// The chain gave no usable entropy for the reveal block.
+error EntropyUnavailable();
+
+/// A season window that has already ended can never be minted in.
+error WindowAlreadyOver(uint64 closesAt);
+
+/// The manifest hash is zero.
+error ManifestInvalid();
+
+/// The manifest is write-once.
+error ManifestAlreadyCommitted();
+
+/// A season seed cannot be committed before the trait manifest is.
+error ManifestNotCommitted();
+
+/// A refinement would give the higher-generation token a third refine; two is the lifetime limit.
+error RefineLimitReached(uint256 tokenId);
+
+/// A trait choice is 0 (parent A), 1 (parent B) or 2 (draw).
+error InvalidChoice(uint8 slot, uint8 choice);
+
+/// An Acorn proof was supplied but no Acorn source is set.
+error AcornSourceNotSet();
+
+/// The Acorn source is write-once.
+error AcornSourceAlreadySet();
+
+/// The lock base fee exceeds the ceiling.
+error LockBaseFeeTooHigh(uint256 fee, uint256 max);

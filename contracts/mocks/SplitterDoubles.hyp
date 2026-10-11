@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../interfaces/IArkFlow.hyp";
+import "../utils/ArkFlowReceiver.hyp";
+
+/// Test-only. Stands in for the treasury router and the cushion.
+contract SplitterSink is ArkFlowReceiver {
+    bool public primaryOpen = true;
+    uint256 public cushionCeiling = type(uint256).max;
+
+    function setPrimaryOpen(bool v) external {
+        primaryOpen = v;
+    }
+
+    function setCushionCeiling(uint256 v) external {
+        cushionCeiling = v;
+    }
+
+    function _lane(bytes32 lane) internal view override returns (LaneInfo memory info) {
+        if (lane == ArkLanes.CUSHION) {
+            uint256 held = _received(lane);
+            uint256 room = held >= cushionCeiling ? 0 : cushionCeiling - held;
+            info = LaneInfo({declared: true, open: room > 0, oneWay: true, defensive: true, room: room});
+        } else if (lane == ArkLanes.TREASURY_QURRL_PRIMARY || lane == ArkLanes.TREASURY_QURRL_SECONDARY) {
+            info = LaneInfo({declared: true, open: primaryOpen, oneWay: false, defensive: false, room: type(uint256).max});
+        }
+    }
+}
+
+/// Test-only. A Q-Day oracle whose answer the test sets.
+contract FrozenDouble {
+    bool public frozen;
+
+    function set(bool v) external {
+        frozen = v;
+    }
+}
+
+/// Test-only. A creator that refuses value.
+contract RefusesValue {}

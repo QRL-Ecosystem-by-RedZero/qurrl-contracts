@@ -1,0 +1,293 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkFlow.hyp";
+import "./utils/ArkFlowReceiver.hyp";
+import "./utils/QurrlErrors.hyp";
+
+interface IQurrlWithdraw {
+    function withdraw(address to) external;
+}
+
+interface IQDayFrozen {
+    function frozen() external view returns (bool);
+}
+
+/**
+ * Where Qurrl's money is divided.
+ *
+ * `QurrlNFT.withdraw` sends its whole balance to one address and has ~480 bytes
+ * of headroom, so the division lives here: this contract holds `TREASURER_ROLE`,
+ * pulls the balance with `sweep`, and keeps four ledgers.
+ *
+ *   mint and fusion:   creator 10%  |  cushion `cushionBps`  |  treasury, the rest
+ *   secondary fees:    creator 10%  |  treasury 90%
+ *
+ * Nothing is pushed. Each ledger is paid by its own `claim*`, so a creator that
+ * rejects value, a treasury that is closed or a cushion at its ceiling blocks
+ * only its own line.
+ *
+ * WHAT CANNOT BE CHANGED, AND WHAT CAN
+ * ------------------------------------
+ * `CREATOR_BPS` is a constant: a captured vote must not be able to raise the
+ * creator's share. `cushionBps` is the one governed number, bounded to
+ * [MIN, MAX] and moved at most MAX_STEP per call, and it applies only to money
+ * swept after the change: `setCushionBps` sweeps first, so revenue that arrived
+ * under the old rate is divided at the old rate.
+ *
+ * The treasury and cushion addresses are set once by governance and never
+ * re-pointed. The deployer has no wiring right here: if it were left with one it would
+ * still hold the treasury line after the handover. Until the cushion is wired, its ledger simply accumulates, and
+ * the only place it can ever go is that address.
+ *
+ * Q-DAY
+ * -----
+ * While the oracle reports `frozen()`, the creator and treasury claims revert.
+ * The cushion claim stays open: money entering a reserve is the one flow an
+ * alarm never needs to stop. A reverting oracle reads as not frozen, so a
+ * broken oracle cannot lock the creator's money.
+ *
+ * SECONDARY FEES
+ * --------------
+ * A marketplace that honours ERC-2981 pays the royalty receiver with a plain
+ * transfer, so this contract has a `receive()` and takes it on the QURRL_FEES
+ * lane. The one sender it ignores is the collection itself: `withdraw` pays this
+ * contract by the same route and must not be read as a fee.
+ */
+contract QurrlRevenueSplitter is ArkFlowReceiver, ReentrancyGuard {
+    uint16 public constant BPS = 10_000;
+    uint16 public constant CREATOR_BPS = 1_000;
+    uint16 public constant MIN_CUSHION_BPS = 2_000;
+    uint16 public constant MAX_CUSHION_BPS = 5_000;
+    /// A quarter of the 20% - 50% range.
+    uint16 public constant MAX_STEP_BPS = 750;
+
+    address public immutable nft;
+    /// Zero where the deployment has no Q-Day oracle.
+    address public immutable qday;
+
+    address public governance;
+    address public pendingGovernance;
+    address public creator;
+    address public pendingCreator;
+    address public treasury;
+    address public cushion;
+
+    uint16 public cushionBps;
+    uint64 public sweeps;
+
+    uint256 public creatorOwed;
+    uint256 public cushionOwed;
+    uint256 public treasuryPrimaryOwed;
+    uint256 public treasurySecondaryOwed;
+
+    event Swept(uint256 indexed sweepId, uint256 amount, uint256 toCreator, uint256 toCushion, uint256 toTreasury);
+    event FeeReceived(address indexed from, uint256 amount, uint256 toCreator, uint256 toTreasury);
+    event CreatorPaid(address indexed to, uint256 amount);
+    event TreasuryPaid(address indexed to, uint256 primary, uint256 secondary);
+    event CushionPaid(address indexed to, uint256 amount);
+    event CushionBpsSet(uint16 previous, uint16 current);
+    event TreasuryWired(address indexed treasury);
+    event CushionWired(address indexed cushion);
+    event GovernanceProposed(address indexed proposed);
+    event GovernanceAccepted(address indexed governance);
+    event CreatorProposed(address indexed proposed);
+    event CreatorAccepted(address indexed creator);
+
+    error NotGovernance();
+    error NotCreator();
+    error NotPending();
+    error AlreadyWired();
+    error CushionBpsOutOfRange(uint16 bps);
+    error CushionStepTooLarge(uint16 from, uint16 to);
+    error FrozenByQDay();
+    error NothingOwed();
+    error PayoutFailed(address to, uint256 amount);
+
+    constructor(address nft_, address creator_, address governance_, address qday_, uint16 cushionBps_) {
+        if (nft_ == address(0) || creator_ == address(0) || governance_ == address(0)) revert ZeroAddress();
+        if (cushionBps_ < MIN_CUSHION_BPS || cushionBps_ > MAX_CUSHION_BPS) revert CushionBpsOutOfRange(cushionBps_);
+        nft = nft_;
+        qday = qday_;
+        creator = creator_;
+        governance = governance_;
+        cushionBps = cushionBps_;
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Wiring (governance, once each)                                     */
+    /* ----------------------------------------------------------------- */
+
+    function setTreasury(address treasury_) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (treasury != address(0)) revert AlreadyWired();
+        if (treasury_ == address(0)) revert ZeroAddress();
+        treasury = treasury_;
+        emit TreasuryWired(treasury_);
+    }
+
+    function setCushion(address cushion_) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (cushion != address(0)) revert AlreadyWired();
+        if (cushion_ == address(0)) revert ZeroAddress();
+        cushion = cushion_;
+        emit CushionWired(cushion_);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Intake                                                             */
+    /* ----------------------------------------------------------------- */
+
+    /// Permissionless. Pulls the collection's balance and divides it at today's rate.
+    function sweep() external nonReentrant returns (uint256) {
+        return _sweep();
+    }
+
+    function _sweep() private returns (uint256 amount) {
+        if (nft.balance != 0) IQurrlWithdraw(nft).withdraw(address(this));
+
+        // Whatever the contract holds beyond its ledgers is revenue not yet booked: the
+        // collection's balance, and anything that reached it outside this function (a direct
+        // `withdraw` by a treasurer, a forced send). Booking by difference means none of it
+        // can be stranded.
+        uint256 booked = creatorOwed + cushionOwed + treasuryPrimaryOwed + treasurySecondaryOwed;
+        amount = address(this).balance - booked;
+        if (amount == 0) return 0;
+
+        uint256 toCreator = (amount * CREATOR_BPS) / BPS;
+        uint256 toCushion = (amount * cushionBps) / BPS;
+        // Rounding dust goes to the treasury.
+        uint256 toTreasury = amount - toCreator - toCushion;
+
+        creatorOwed += toCreator;
+        cushionOwed += toCushion;
+        treasuryPrimaryOwed += toTreasury;
+
+        emit Swept(++sweeps, amount, toCreator, toCushion, toTreasury);
+    }
+
+    receive() external payable {
+        // The collection pays this address when swept; that is revenue, not a fee.
+        if (msg.sender == nft) return;
+        _accept(ArkLanes.QURRL_FEES, msg.sender, msg.value, bytes32(0));
+    }
+
+    function _lane(bytes32 lane) internal pure override returns (LaneInfo memory info) {
+        if (lane == ArkLanes.QURRL_FEES) {
+            info = LaneInfo({declared: true, open: true, oneWay: false, defensive: true, room: type(uint256).max});
+        }
+    }
+
+    function _onDeposit(bytes32, address from, uint256 amount, bytes32) internal override {
+        uint256 toCreator = (amount * CREATOR_BPS) / BPS;
+        uint256 toTreasury = amount - toCreator;
+        creatorOwed += toCreator;
+        treasurySecondaryOwed += toTreasury;
+        emit FeeReceived(from, amount, toCreator, toTreasury);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Claims (permissionless; each pays only its own line)               */
+    /* ----------------------------------------------------------------- */
+
+    function claimCreator() external nonReentrant returns (uint256 amount) {
+        if (_frozen()) revert FrozenByQDay();
+        amount = creatorOwed;
+        if (amount == 0) revert NothingOwed();
+        creatorOwed = 0;
+
+        address to = creator;
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) revert PayoutFailed(to, amount);
+        emit CreatorPaid(to, amount);
+    }
+
+    /// Pays what the treasury lane will take now; the rest stays owed.
+    function claimTreasury() external nonReentrant returns (uint256 primary, uint256 secondary) {
+        if (_frozen()) revert FrozenByQDay();
+        address to = treasury;
+        if (to == address(0)) revert NothingOwed();
+
+        bytes32 ref = bytes32(uint256(sweeps));
+        primary = ArkFlowSend.push(to, ArkLanes.TREASURY_QURRL_PRIMARY, ref, treasuryPrimaryOwed);
+        secondary = ArkFlowSend.push(to, ArkLanes.TREASURY_QURRL_SECONDARY, ref, treasurySecondaryOwed);
+        if (primary == 0 && secondary == 0) revert NothingOwed();
+
+        treasuryPrimaryOwed -= primary;
+        treasurySecondaryOwed -= secondary;
+        emit TreasuryPaid(to, primary, secondary);
+    }
+
+    /// Open during a Q-Day freeze.
+    function claimCushion() external nonReentrant returns (uint256 sent) {
+        address to = cushion;
+        if (to == address(0)) revert NothingOwed();
+
+        sent = ArkFlowSend.push(to, ArkLanes.CUSHION, bytes32(uint256(sweeps)), cushionOwed);
+        if (sent == 0) revert NothingOwed();
+
+        cushionOwed -= sent;
+        emit CushionPaid(to, sent);
+    }
+
+    function _frozen() private view returns (bool) {
+        if (qday == address(0)) return false;
+        try IQDayFrozen(qday).frozen() returns (bool f) {
+            return f;
+        } catch {
+            return false;
+        }
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Governed                                                           */
+    /* ----------------------------------------------------------------- */
+
+    /// Sweeps first, so revenue already in the collection is divided at the old rate.
+    function setCushionBps(uint16 next) external nonReentrant {
+        if (msg.sender != governance) revert NotGovernance();
+        if (next < MIN_CUSHION_BPS || next > MAX_CUSHION_BPS) revert CushionBpsOutOfRange(next);
+
+        uint16 previous = cushionBps;
+        uint16 step = next > previous ? next - previous : previous - next;
+        if (step > MAX_STEP_BPS) revert CushionStepTooLarge(previous, next);
+
+        _sweep();
+        cushionBps = next;
+        emit CushionBpsSet(previous, next);
+    }
+
+    function proposeGovernance(address next) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (next == address(0)) revert ZeroAddress();
+        pendingGovernance = next;
+        emit GovernanceProposed(next);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPending();
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(msg.sender);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Creator                                                            */
+    /* ----------------------------------------------------------------- */
+
+    function proposeCreator(address next) external {
+        if (msg.sender != creator) revert NotCreator();
+        if (next == address(0)) revert ZeroAddress();
+        pendingCreator = next;
+        emit CreatorProposed(next);
+    }
+
+    function acceptCreator() external {
+        if (msg.sender != pendingCreator) revert NotPending();
+        creator = msg.sender;
+        pendingCreator = address(0);
+        emit CreatorAccepted(msg.sender);
+    }
+}

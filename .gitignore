@@ -1,0 +1,18 @@
+node_modules/
+build/
+abi/
+.env
+.env.*
+!.env.example
+.claude/
+.kurtosis/
+txt/
+
+# Dev logs and agent memory stay local (removed from history 2026-10-02).
+/CLAUDE.md
+build-qrvm/
+abi-qrvm/
+build-qrvm-devnet/
+build-devnet/
+
+deployments/*.json

@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/access/AccessControl.hyp";
+import "./lib/openzeppelin/utils/Strings.hyp";
+
+import "./interfaces/IQurrlMetadata.hyp";
+import "./utils/QurrlErrors.hyp";
+
+interface IQurrlRevealState {
+    function traitsOf(uint256 tokenId) external view returns (uint8[6] memory traits, bool revealed);
+}
+
+/**
+ * The metadata renderer for QurrlNFT.
+ *
+ * A token whose traits are still sealed gets one shared placeholder URI, so a
+ * mint UI and a marketplace have something to show and nothing to learn. A
+ * revealed token gets `revealedBase + id`.
+ *
+ * Both URIs are plain strings the admin sets after the art exists, and
+ * `freeze()` makes them permanent. Until then the admin can repoint the
+ * metadata, which is the price of "metadata comes later"; a holder who needs
+ * more than a promise should wait for `frozen()`.
+ *
+ * Nothing here knows what a trait is called. Trait names and art are not
+ * published before the reveal (CLAUDE.md "Trait confidentiality"), and this
+ * contract has no field in which to leak them.
+ */
+contract QurrlMetadata is IQurrlMetadata, AccessControl {
+    address public immutable nft;
+
+    string public sealedURI;
+    string public revealedBase;
+    bool public frozen;
+
+    event URIsSet(string sealedURI, string revealedBase);
+    event Frozen();
+
+    error MetadataFrozen();
+
+    constructor(address nft_, address admin) {
+        if (nft_ == address(0) || admin == address(0)) revert ZeroAddress();
+        nft = nft_;
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+    }
+
+    function setURIs(string calldata sealedURI_, string calldata revealedBase_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (frozen) revert MetadataFrozen();
+        sealedURI = sealedURI_;
+        revealedBase = revealedBase_;
+        emit URIsSet(sealedURI_, revealedBase_);
+    }
+
+    /// Irreversible.
+    function freeze() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        frozen = true;
+        emit Frozen();
+    }
+
+    function tokenURI(uint256 tokenId) external view returns (string memory) {
+        (, bool revealed) = IQurrlRevealState(nft).traitsOf(tokenId);
+        if (!revealed) return sealedURI;
+        return string(abi.encodePacked(revealedBase, Strings.toString(tokenId)));
+    }
+}

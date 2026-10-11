@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC721/ERC721.hyp";
+import "./lib/openzeppelin/access/AccessControl.hyp";
+import "./lib/openzeppelin/security/Pausable.hyp";
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+import "./lib/openzeppelin/utils/cryptography/MerkleProof.hyp";
+
+import "./interfaces/IQurrlNFT.hyp";
+import "./interfaces/IQurrlTraitRegistry.hyp";
+import "./interfaces/IQurrlMetadata.hyp";
+import "./utils/QurrlErrors.hyp";
+
+/// The Acorn oracle root, read from the phase minter.
+interface IAcornRootSource {
+    function acornRoot() external view returns (bytes32);
+}
+
+/**
+ * Qurrl - the QRL mascot collection.
+ *
+ * Two supply numbers exist and they are not the same number:
+ *
+ *   lifetime issuance   `totalMinted`, monotonic, capped at MAX_SUPPLY (10,500)
+ *   circulating set     `totalMinted - totalBurned`
+ *
+ * MAX_SUPPLY bounds issuance, not ownership. Fusion burns two tokens and mints
+ * one, so it spends one unit of issuance headroom while removing two tokens
+ * from circulation. The ceiling can only ever be approached, never re-opened:
+ * a burned id is never reissued and `totalMinted` never decreases. That is what
+ * makes "10,500 including burns" an honest number rather than a marketing one.
+ *
+ * Token ids are dense from 1, and so are season ids, so a record whose
+ * `seasonId` is 0 unambiguously means "never minted" and no second existence
+ * mapping is needed.
+ *
+ * Who may mint, at what price and against which allowlist or Acorn balance is
+ * not decided here: `QurrlPhaseMinter` holds `MINTER_ROLE` and runs the pools.
+ * This contract keeps what must hold whoever mints: the season window, the
+ * season cap and the lifetime ceiling.
+ */
+contract QurrlNFT is IQurrlNFT, ERC721, AccessControl, Pausable, ReentrancyGuard {
+    /// Configures seasons and points the mint at one of them.
+    bytes32 public constant SEASON_ADMIN_ROLE = keccak256("SEASON_ADMIN_ROLE");
+    /// Issues primary supply inside the active season's mint window.
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    /// Withdraws accumulated mint and fusion fees.
+    bytes32 public constant TREASURER_ROLE = keccak256("TREASURER_ROLE");
+    /// Halts mint and fusion. Transfers are deliberately never pausable.
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+
+    /**
+     * Lifetime issuance ceiling.
+     *
+     * 10,500 is 105 x 100, and 105 is QRL's own 105,000,000 max supply divided
+     * by a million. Every season allocation in the shipped schedule is a
+     * multiple of 105 for the same reason.
+     */
+    uint256 public constant MAX_SUPPLY = 10500;
+    uint16 private constant MAX_ROYALTY_BPS = 500;
+
+    uint256 private constant TRAIT_SLOTS = 6;
+
+    /// Lifetime refinements a token (and the lineage it passes on) can take.
+    uint8 public constant MAX_REFINES = 2;
+    /// Earned Acorn points at which a wallet gains its 1st, 2nd and 3rd free trait lock.
+    uint64 public constant LOCK_TIER_1 = 501;
+    uint64 public constant LOCK_TIER_2 = 2001;
+    uint64 public constant LOCK_TIER_3 = 5001;
+    uint128 public constant MAX_LOCK_BASE_FEE = 4_000_000_000_000_000_000;
+
+    /// Source of the Acorn root that proves a fusing wallet's tier. Set once.
+    address public acornSource;
+
+    IQurrlTraitRegistry public immutable traitRegistry;
+
+    mapping(uint16 => SeasonConfig) private _seasons;
+    mapping(uint16 => uint32) private _primaryMinted;
+    mapping(uint16 => uint32) private _fusionMinted;
+
+    /**
+     * Records outlive their tokens. A fused-away parent keeps its record so
+     * `lockedFrom` stays resolvable and a lineage can be walked back to a
+     * generation-0 mint long after both parents have been burned.
+     */
+    mapping(uint256 => TokenRecord) private _records;
+
+    uint16 private _activeSeason;
+    uint16 private _seasonCount;
+    uint32 private _totalMinted;
+    uint32 private _totalBurned;
+    /// Sum of every configured season's caps. Never exceeds MAX_SUPPLY.
+    uint32 private _allocated;
+
+    address public renderer;
+
+    /// Secondary-sale royalty: receiver and rate share one slot.
+    address private _royaltyReceiver;
+    uint16 private _royaltyBps;
+
+    constructor(
+        string memory name_,
+        string memory symbol_,
+        address admin,
+        address registry
+    ) ERC721(name_, symbol_) {
+        if (admin == address(0) || registry == address(0)) revert ZeroAddress();
+
+        traitRegistry = IQurrlTraitRegistry(registry);
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(SEASON_ADMIN_ROLE, admin);
+        _grantRole(TREASURER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Season administration                                              */
+    /* ----------------------------------------------------------------- */
+
+    /**
+     * Creates the next season, or retunes one that has not opened yet.
+     *
+     * Two preconditions are enforced rather than documented, because both are
+     * load-bearing for fairness:
+     *
+     *  1. The trait palette must be sealed. Variant counts are the modulus in
+     *     the trait derivation, so a palette edited after a reveal would
+     *     silently rewrite the traits of tokens already minted.
+     *  2. The season reveal seed must already be committed. Configuring first
+     *     and committing afterwards would let the curator read the shape of the
+     *     mint before choosing a seed.
+     *
+     * Seasons are append-only and dense from 1. A season stops being editable
+     * the instant its window opens, so nobody can be minting under a tariff
+     * that is being changed underneath them.
+     */
+    function configureSeason(uint16 seasonId, SeasonConfig calldata config)
+        external
+        onlyRole(SEASON_ADMIN_ROLE)
+    {
+        if (!traitRegistry.paletteFrozen()) revert PaletteNotFrozen();
+        if (!traitRegistry.hasCommitment(seasonId)) revert SeedNotCommitted(seasonId);
+        if (config.closesAt <= config.opensAt) revert InvalidWindow(config.opensAt, config.closesAt);
+        if (config.closesAt <= block.timestamp) revert WindowAlreadyOver(config.closesAt);
+        uint64 revealAt = traitRegistry.revealNotBeforeOf(seasonId);
+        if (revealAt < config.closesAt) revert RevealBeforeClose(seasonId, revealAt, config.closesAt);
+        if (config.primaryCap == 0 && config.fusionCap == 0) revert ZeroQuantity();
+        if (config.lockBaseFee > MAX_LOCK_BASE_FEE) revert LockBaseFeeTooHigh(config.lockBaseFee, MAX_LOCK_BASE_FEE);
+        // The fusion window opens no earlier than the reveal, so the season's own tokens can be
+        // fused in it; before the reveal nothing in the season could be fused anyway.
+        if (config.fusionCap != 0) {
+            if (config.fusionOpensAt < revealAt) revert FusionBeforeReveal(seasonId, revealAt, config.fusionOpensAt);
+            if (config.fusionClosesAt <= config.fusionOpensAt) {
+                revert InvalidWindow(config.fusionOpensAt, config.fusionClosesAt);
+            }
+        }
+
+        uint16 next = _seasonCount + 1;
+        uint32 previous = 0;
+
+        if (seasonId == next) {
+            _seasonCount = next;
+        } else if (seasonId >= 1 && seasonId <= _seasonCount) {
+            SeasonConfig storage current = _seasons[seasonId];
+            if (block.timestamp >= current.opensAt) revert SeasonLocked(seasonId);
+            previous = current.primaryCap + current.fusionCap;
+        } else {
+            revert SeasonOutOfOrder(next, seasonId);
+        }
+
+        uint32 allocated = _allocated - previous + config.primaryCap + config.fusionCap;
+        if (allocated > MAX_SUPPLY) revert AllocationExceeded(allocated, MAX_SUPPLY);
+
+        _allocated = allocated;
+        _seasons[seasonId] = config;
+
+        emit SeasonConfigured(seasonId, config.primaryCap, config.fusionCap, config.opensAt, config.closesAt);
+    }
+
+    /// Points `mintTo` and `fuse` at a season. Exactly one season is live at a time.
+    function setActiveSeason(uint16 seasonId) external onlyRole(SEASON_ADMIN_ROLE) {
+        if (seasonId == 0 || seasonId > _seasonCount) revert SeasonNotConfigured(seasonId);
+        _activeSeason = seasonId;
+        emit SeasonActivated(seasonId);
+    }
+
+    /// Points tier proofs at the phase minter's Acorn root. Once.
+    function setAcornSource(address source) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (source == address(0)) revert ZeroAddress();
+        if (acornSource != address(0)) revert AcornSourceAlreadySet();
+        acornSource = source;
+        emit AcornSourceSet(source);
+    }
+
+    /// The rate is capped at 5%; a zero rate disables the royalty.
+    function setRoyalty(address receiver, uint16 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (bps > MAX_ROYALTY_BPS || receiver == address(0)) revert RoyaltyOutOfRange(bps);
+        _royaltyReceiver = receiver;
+        _royaltyBps = bps;
+        emit RoyaltySet(receiver, bps);
+    }
+
+    /// EIP-2981 shape. Not token-specific and not gated on existence.
+    function royaltyInfo(uint256, uint256 salePrice) external view returns (address, uint256) {
+        return (_royaltyReceiver, (salePrice * _royaltyBps) / 10_000);
+    }
+
+    /// Metadata is rendered by a separate contract so the art can arrive after the collection does.
+    function setRenderer(address renderer_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        renderer = renderer_;
+        emit RendererSet(renderer_);
+    }
+
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        _requireMinted(tokenId);
+        address r = renderer;
+        return r == address(0) ? "" : IQurrlMetadata(r).tokenURI(tokenId);
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function withdraw(address to) external onlyRole(TREASURER_ROLE) nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 amount = address(this).balance;
+        if (amount == 0) revert NothingToWithdraw();
+
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed(to, amount);
+
+        emit TreasuryWithdrawn(to, amount);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Minting                                                            */
+    /* ----------------------------------------------------------------- */
+
+    /**
+     * Primary issuance for the phase minter.
+     *
+     * The minter decides who may mint and charges its pool's fee; the value it
+     * forwards stays here, so `withdraw` (held by the revenue splitter) sweeps
+     * mint and fusion revenue together. What holds regardless of the minter is
+     * checked here: the active season's mint window, its primary cap and the
+     * lifetime ceiling.
+     */
+    function mintTo(address to, uint32 quantity)
+        external
+        payable
+        onlyRole(MINTER_ROLE)
+        whenNotPaused
+        nonReentrant
+        returns (uint256 firstTokenId)
+    {
+        uint16 seasonId = _activeSeason;
+        SeasonConfig storage season = _activeConfig(seasonId);
+        _requireWindow(seasonId, season.opensAt, season.closesAt);
+
+        if (quantity == 0) revert ZeroQuantity();
+        if (to == address(0)) revert ZeroAddress();
+
+        uint32 minted = _primaryMinted[seasonId];
+        if (minted + quantity > season.primaryCap) revert SeasonSoldOut(seasonId);
+        if (uint256(_totalMinted) + quantity > MAX_SUPPLY) revert MaxSupplyReached(MAX_SUPPLY);
+
+        _primaryMinted[seasonId] = minted + quantity;
+
+        firstTokenId = uint256(_totalMinted) + 1;
+        _totalMinted += quantity;
+
+        for (uint32 i = 0; i < quantity; ++i) {
+            uint256 tokenId = firstTokenId + i;
+            _records[tokenId] = TokenRecord({
+                seasonId: seasonId,
+                generation: 1,
+                traitsLocked: false,
+                lockedTraits: 0,
+                lockedFrom: 0,
+                refineCount: 0
+            });
+            _safeMint(to, tokenId);
+        }
+
+        emit Minted(seasonId, to, firstTokenId, quantity);
+    }
+
+    /**
+     * Burns two Qurrls and issues one heir whose trait vector is stored for good.
+     *
+     * TWO MODES, ONE FUNCTION
+     *  - equal generations: ascension. The heir is that generation + 1 and its refine count restarts.
+     *  - unequal generations: refinement. The heir keeps the higher generation and the lower
+     *    parent is the bait. The higher token may take at most MAX_REFINES refinements in its
+     *    lineage; the heir carries the count forward.
+     *
+     * TRAITS
+     * `choices[i]` is 0 (slot from A), 1 (slot from B) or 2 (drawn). A drawn slot comes from A
+     * with probability genA / (genA + genB), so equal generations draw 50/50 and a refinement
+     * favours the higher token. The draw is a hash of the season's revealed seed, the two ids
+     * and the slot: it is fixed by the pair and their order, readable beforehand through
+     * `quoteFusion`, and cannot be re-rolled by retrying a transaction. Each choice other than
+     * 2 is a lock. The first `freeLocks(earned)` locks are free, which needs a proof of the
+     * caller's earned Acorn points; later ones cost `lockBaseFee * 2^(i-1)`, so six paid locks
+     * cost 63 times the base fee.
+     *
+     * Both parents must already be revealed: locking a trait set nobody has seen is a lottery.
+     * The heir goes to the owner of A, so an approved operator cannot redirect it.
+     */
+    function fuse(
+        uint256 tokenA,
+        uint256 tokenB,
+        uint8[6] calldata choices,
+        uint64 earned,
+        bytes32[] calldata proof
+    ) external payable whenNotPaused nonReentrant returns (uint256 tokenId) {
+        uint16 seasonId = _activeSeason;
+        SeasonConfig storage season = _activeConfig(seasonId);
+
+        if (season.fusionCap == 0) revert FusionDisabled(seasonId);
+        _requireWindow(seasonId, season.fusionOpensAt, season.fusionClosesAt);
+
+        if (!_isApprovedOrOwner(msg.sender, tokenA)) revert NotTokenHolder(tokenA, msg.sender);
+        if (!_isApprovedOrOwner(msg.sender, tokenB)) revert NotTokenHolder(tokenB, msg.sender);
+
+        uint32 fused = _fusionMinted[seasonId];
+        if (fused + 1 > season.fusionCap) revert FusionBudgetExhausted(seasonId);
+        if (uint256(_totalMinted) + 1 > MAX_SUPPLY) revert MaxSupplyReached(MAX_SUPPLY);
+
+        Plan memory plan = _plan(seasonId, tokenA, tokenB, choices, _provenFreeLocks(earned, proof), season.lockBaseFee);
+        uint256 due = uint256(season.fusionFee) + plan.lockFee;
+        if (msg.value != due) revert IncorrectPayment(due, msg.value);
+
+        address recipient = ownerOf(tokenA);
+        _burn(tokenA);
+        _burn(tokenB);
+        _totalBurned += 2;
+
+        tokenId = uint256(_totalMinted) + 1;
+        _records[tokenId] = TokenRecord({
+            seasonId: seasonId,
+            generation: plan.generation,
+            traitsLocked: true,
+            lockedTraits: _pack(plan.traits),
+            lockedFrom: uint32(tokenA),
+            refineCount: plan.refineCount
+        });
+
+        _fusionMinted[seasonId] = fused + 1;
+        _totalMinted += 1;
+
+        _safeMint(recipient, tokenId);
+
+        emit Fused(tokenId, recipient, tokenA, tokenB, plan.generation);
+        emit FusionTerms(tokenId, plan.locked, plan.freeUsed, plan.lockFee, plan.refineCount);
+    }
+
+    /// What `fuse` would produce for these inputs and a caller with `free` free locks, without sending it.
+    function quoteFusion(uint256 tokenA, uint256 tokenB, uint8[6] calldata choices, uint8 free)
+        external
+        view
+        returns (uint8[6] memory traits, uint16 generation, uint8 refineCount, uint256 lockFee, uint256 total)
+    {
+        uint16 seasonId = _activeSeason;
+        SeasonConfig storage season = _activeConfig(seasonId);
+        Plan memory plan = _plan(seasonId, tokenA, tokenB, choices, free, season.lockBaseFee);
+        return (plan.traits, plan.generation, plan.refineCount, plan.lockFee, uint256(season.fusionFee) + plan.lockFee);
+    }
+
+    /// Free trait locks for a wallet with `earned` Acorn points: 0, 1, 2 or 3.
+    function freeLocks(uint64 earned) public pure returns (uint8) {
+        if (earned >= LOCK_TIER_3) return 3;
+        if (earned >= LOCK_TIER_2) return 2;
+        if (earned >= LOCK_TIER_1) return 1;
+        return 0;
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Views                                                              */
+    /* ----------------------------------------------------------------- */
+
+    /**
+     * Trait vector plus whether it is knowable.
+     *
+     * Never reverts on a sealed season: the mint UI has to render an unrevealed
+     * token, and a read that throws would force every caller to guess when it
+     * is safe to ask.
+     */
+    function traitsOf(uint256 tokenId) external view returns (uint8[6] memory traits, bool revealed) {
+        TokenRecord storage record = _records[tokenId];
+        if (record.seasonId == 0) revert UnknownToken(tokenId);
+
+        if (record.traitsLocked) return (_unpack(record.lockedTraits), true);
+        if (!traitRegistry.isRevealed(record.seasonId)) return (traits, false);
+
+        return (traitRegistry.deriveTraits(record.seasonId, tokenId), true);
+    }
+
+    function recordOf(uint256 tokenId) external view returns (TokenRecord memory) {
+        TokenRecord memory record = _records[tokenId];
+        if (record.seasonId == 0) revert UnknownToken(tokenId);
+        return record;
+    }
+
+    function seasonView(uint16 seasonId) external view returns (SeasonView memory) {
+        return
+            SeasonView({
+                config: _seasons[seasonId],
+                primaryMinted: _primaryMinted[seasonId],
+                fusionMinted: _fusionMinted[seasonId],
+                exists: seasonId >= 1 && seasonId <= _seasonCount
+            });
+    }
+
+    function totalMinted() external view returns (uint32) {
+        return _totalMinted;
+    }
+
+    function totalBurned() external view returns (uint32) {
+        return _totalBurned;
+    }
+
+    function allocatedSupply() external view returns (uint32) {
+        return _allocated;
+    }
+
+    function activeSeason() external view returns (uint16) {
+        return _activeSeason;
+    }
+
+    function seasonCount() external view returns (uint16) {
+        return _seasonCount;
+    }
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721, AccessControl)
+        returns (bool)
+    {
+        return interfaceId == 0x2a55205a || super.supportsInterface(interfaceId);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Internals                                                          */
+    /* ----------------------------------------------------------------- */
+
+    struct Plan {
+        uint8[6] traits;
+        uint16 generation;
+        uint8 refineCount;
+        uint8 locked;
+        uint8 freeUsed;
+        uint256 lockFee;
+    }
+
+    /// Free locks the caller can prove. No proof means none; a proof must match the oracle root.
+    function _provenFreeLocks(uint64 earned, bytes32[] calldata proof) private view returns (uint8) {
+        if (earned == 0 && proof.length == 0) return 0;
+        if (acornSource == address(0)) revert AcornSourceNotSet();
+        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encodePacked(msg.sender, earned))));
+        if (!MerkleProof.verify(proof, IAcornRootSource(acornSource).acornRoot(), leaf)) revert InvalidMerkleProof();
+        return freeLocks(earned);
+    }
+
+    /// Resolves generation, refine count, traits and lock fee. No side effects.
+    function _plan(uint16 seasonId, uint256 a, uint256 b, uint8[6] calldata choices, uint8 free, uint128 baseFee)
+        private
+        view
+        returns (Plan memory p)
+    {
+        if (a == b) revert IdenticalTokens(a);
+        if (!traitRegistry.isRevealed(seasonId)) revert TraitsNotRevealed(seasonId);
+
+        uint8[6] memory ta = _traitsFor(a);
+        uint8[6] memory tb = _traitsFor(b);
+        uint256 ga = _records[a].generation;
+        uint256 gb = _records[b].generation;
+
+        if (ga == gb) {
+            p.generation = uint16(ga + 1);
+        } else {
+            uint256 high = ga > gb ? a : b;
+            uint8 taken = _records[high].refineCount;
+            if (taken >= MAX_REFINES) revert RefineLimitReached(high);
+            p.generation = uint16(ga > gb ? ga : gb);
+            p.refineCount = taken + 1;
+        }
+
+        bytes32 seed = traitRegistry.seedOf(seasonId);
+        for (uint256 i = 0; i < TRAIT_SLOTS; ++i) {
+            uint8 c = choices[i];
+            if (c > 2) revert InvalidChoice(uint8(i), c);
+            if (c == 0) {
+                p.traits[i] = ta[i];
+                ++p.locked;
+            } else if (c == 1) {
+                p.traits[i] = tb[i];
+                ++p.locked;
+            } else {
+                uint256 r = uint256(keccak256(abi.encodePacked(seed, a, b, uint8(i)))) % (ga + gb);
+                p.traits[i] = r < ga ? ta[i] : tb[i];
+            }
+        }
+
+        p.freeUsed = p.locked < free ? p.locked : free;
+        uint8 paid = p.locked - p.freeUsed;
+        p.lockFee = uint256(baseFee) * ((uint256(1) << paid) - 1);
+    }
+
+    /// Stored traits for a fused token, derived ones for a revealed primary. Reverts for a missing token.
+    function _traitsFor(uint256 tokenId) private view returns (uint8[6] memory) {
+        _requireMinted(tokenId);
+        TokenRecord storage record = _records[tokenId];
+        if (record.traitsLocked) return _unpack(record.lockedTraits);
+        if (!traitRegistry.isRevealed(record.seasonId)) revert TraitsNotRevealed(record.seasonId);
+        return traitRegistry.deriveTraits(record.seasonId, tokenId);
+    }
+
+    function _activeConfig(uint16 seasonId) private view returns (SeasonConfig storage) {
+        if (seasonId == 0 || seasonId > _seasonCount) revert SeasonNotConfigured(seasonId);
+        return _seasons[seasonId];
+    }
+
+    function _requireWindow(uint16 seasonId, uint64 opensAt, uint64 closesAt) private view {
+        if (block.timestamp < opensAt || block.timestamp >= closesAt) revert SeasonNotOpen(seasonId);
+    }
+
+    function _pack(uint8[6] memory traits) private pure returns (uint48 packed) {
+        for (uint256 i = 0; i < TRAIT_SLOTS; ++i) {
+            packed |= uint48(uint256(traits[i]) << (i * 8));
+        }
+    }
+
+    function _unpack(uint48 packed) private pure returns (uint8[6] memory out) {
+        for (uint256 i = 0; i < TRAIT_SLOTS; ++i) {
+            out[i] = uint8(packed >> (i * 8));
+        }
+    }
+}

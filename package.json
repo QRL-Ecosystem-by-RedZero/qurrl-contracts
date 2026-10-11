@@ -1,0 +1,45 @@
+{
+  "name": "qurrl-contracts",
+  "version": "0.1.0",
+  "description": "Qurrl - the QRL mascot NFT collection in Hyperion for QRL. 10,500 lifetime issuance, one season per ecosystem phase, trait-locking fusion.",
+  "license": "MIT",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "vendor": "node scripts/vendor-oz.js",
+    "compile": "node scripts/compile.js",
+    "build": "npm run vendor && npm run compile",
+    "test": "node test/run.js",
+    "check": "npm run build && npm test",
+    "gas": "node scripts/gas.js",
+    "flatten:contract": "node scripts/flatten.js",
+    "flatten:contract:own": "node scripts/flatten.js --own",
+    "gen:deployer": "node scripts/gen-deployer.js",
+    "deploy": "node scripts/deploy.js",
+    "smoke": "node scripts/smoke.js",
+    "interact": "node scripts/interact.js",
+    "seasons": "node scripts/seasons.js",
+    "handover": "node scripts/handover.js",
+    "renderer": "node scripts/renderer.js",
+    "merkle-check": "node scripts/merkle-check.js",
+    "metadata-check": "node scripts/metadata-check.js",
+    "splitter-check": "node scripts/splitter-check.js",
+    "cushion": "node scripts/cushion.js"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "4.9.6",
+    "@theqrl/abi-v3": "npm:@theqrl/abi@^1.0.3",
+    "@theqrl/hypc": "^0.0.2",
+    "@theqrl/wallet.js": "^2.0.2",
+    "@theqrl/wallet.js-v6": "npm:@theqrl/wallet.js@^6.3.0",
+    "@theqrl/web3": "^0.5.0",
+    "@theqrl/web3-v3": "npm:@theqrl/web3@^1.0.3"
+  },
+  "devDependencies": {
+    "@ethereumjs/common": "^10.1.2",
+    "@ethereumjs/util": "^10.1.2",
+    "@ethereumjs/vm": "^10.1.2",
+    "ethereum-cryptography": "^3.2.0",
+    "ethers": "^6.17.0"
+  }
+}

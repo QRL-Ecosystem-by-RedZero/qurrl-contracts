@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../interfaces/IArkPhase.hyp";
+
+/**
+ * Test and private-network stand-in for contracts/core's `ArkPhase`: anyone may set
+ * the phase. Never deploy it where the ecosystem phase means anything; scripts label
+ * it "(stand-in)".
+ */
+contract ArkPhaseDouble is IArkPhase {
+    uint8 private _phase;
+
+    function set(uint8 next) external {
+        _phase = next;
+    }
+
+    function phase() external view returns (uint8) {
+        return _phase;
+    }
+}
+
+/**
+ * Test and private-network stand-in for the phase minter's Acorn root, so the collection's
+ * tier proofs can be exercised without opening a phase. Anyone may set the root.
+ */
+contract AcornRootDouble {
+    bytes32 public acornRoot;
+
+    function set(bytes32 root) external {
+        acornRoot = root;
+    }
+}

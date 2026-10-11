@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The Qurrl collection.
+ *
+ * Lifetime issuance counts every token id ever minted, burned ones included,
+ * so fusion spends issuance headroom while shrinking the circulating set.
+ *
+ * One season is one ecosystem phase (season id = phase + 1). A season has two
+ * windows in sequence: the mint window, where `MINTER_ROLE` issues primary
+ * supply on behalf of the phase minter's pools, and the fusion window, which
+ * opens at or after the season's reveal so the season's own tokens can be
+ * fused.
+ *
+ * As with the trait registry, every declaration here is backed by an explicit
+ * view function rather than a public state variable.
+ */
+interface IQurrlNFT {
+    /// Allocation and windows for one season. Counters live in `SeasonView`.
+    struct SeasonConfig {
+        uint32 primaryCap;
+        uint32 fusionCap;
+        uint64 opensAt;
+        uint64 closesAt;
+        /// Must be at or after the season's `revealNotBefore`; ignored when `fusionCap` is 0.
+        uint64 fusionOpensAt;
+        uint64 fusionClosesAt;
+        uint128 fusionFee;
+        /// QRL for the first paid trait lock of a fusion; the k-th paid lock costs this times 2^(k-1).
+        uint128 lockBaseFee;
+    }
+
+    struct SeasonView {
+        SeasonConfig config;
+        uint32 primaryMinted;
+        uint32 fusionMinted;
+        bool exists;
+    }
+
+    struct TokenRecord {
+        uint16 seasonId;
+        /// 1 for a primary mint. A fusion of equal generations yields that generation + 1;
+        /// a fusion of unequal generations yields the higher one.
+        uint16 generation;
+        bool traitsLocked;
+        /// Six uint8 variant indices, slot 0 in the low byte. Meaningful only when locked.
+        uint48 lockedTraits;
+        /// The parent whose traits were kept; 0 for a primary mint.
+        uint32 lockedFrom;
+        /// Times this lineage has taken a refinement (unequal-generation fusion); at most 2.
+        uint8 refineCount;
+    }
+
+    function totalMinted() external view returns (uint32);
+
+    function totalBurned() external view returns (uint32);
+
+    function allocatedSupply() external view returns (uint32);
+
+    function activeSeason() external view returns (uint16);
+
+    function seasonCount() external view returns (uint16);
+
+    function recordOf(uint256 tokenId) external view returns (TokenRecord memory);
+
+    function seasonView(uint16 seasonId) external view returns (SeasonView memory);
+
+    /// Trait vector plus whether it is knowable yet; zeros while the season is sealed.
+    function traitsOf(uint256 tokenId) external view returns (uint8[6] memory traits, bool revealed);
+
+    function configureSeason(uint16 seasonId, SeasonConfig calldata config) external;
+
+    function setActiveSeason(uint16 seasonId) external;
+
+    /// Primary issuance for the minter. The value sent is the pool's fee and stays here for `withdraw`.
+    function mintTo(address to, uint32 quantity) external payable returns (uint256 firstTokenId);
+
+    /**
+     * Burns `tokenA` and `tokenB` and issues one heir.
+     *
+     * `choices[i]` for trait slot i: 0 takes the slot from A, 1 from B, 2 leaves it to the
+     * generation-weighted draw. Every slot with a choice other than 2 is a lock; the first
+     * `freeLocks(earned)` locks cost nothing, the rest escalate. `earned` and `proof` prove
+     * the caller's Acorn tier and may be 0 and empty.
+     */
+    function fuse(
+        uint256 tokenA,
+        uint256 tokenB,
+        uint8[6] calldata choices,
+        uint64 earned,
+        bytes32[] calldata proof
+    ) external payable returns (uint256 tokenId);
+
+    /// The heir a fusion would produce and what it costs, for a caller whose free locks are `freeLocks`.
+    function quoteFusion(uint256 tokenA, uint256 tokenB, uint8[6] calldata choices, uint8 freeLocks)
+        external
+        view
+        returns (uint8[6] memory traits, uint16 generation, uint8 refineCount, uint256 lockFee, uint256 total);
+
+    /// Free locks for a wallet that has earned `earned` Acorn points.
+    function freeLocks(uint64 earned) external pure returns (uint8);
+
+    event SeasonConfigured(
+        uint16 indexed seasonId,
+        uint32 primaryCap,
+        uint32 fusionCap,
+        uint64 opensAt,
+        uint64 closesAt
+    );
+    event SeasonActivated(uint16 indexed seasonId);
+    event Minted(uint16 indexed seasonId, address indexed to, uint256 firstTokenId, uint32 quantity);
+    event Fused(
+        uint256 indexed tokenId,
+        address indexed owner,
+        uint256 keptTokenId,
+        uint256 sacrificedTokenId,
+        uint16 generation
+    );
+    event FusionTerms(uint256 indexed tokenId, uint8 locked, uint8 freeUsed, uint256 lockFee, uint8 refineCount);
+    event AcornSourceSet(address indexed source);
+    event RendererSet(address indexed renderer);
+    event RoyaltySet(address indexed receiver, uint16 bps);
+    event TreasuryWithdrawn(address indexed to, uint256 amount);
+}

@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The ecosystem phase (QuantumArk-Phases.md): 0 Genesis Inventory, 1 Lattice Shift,
+ * 2 Classical Sunset, 3 Q-Day, 4 Restoration. Owned by contracts/core (`ArkPhase`);
+ * this is the one read a product needs. The reading already folds in a ratified
+ * Q-Day declaration (phase 3 or above once declared).
+ */
+interface IArkPhase {
+    function phase() external view returns (uint8);
+}

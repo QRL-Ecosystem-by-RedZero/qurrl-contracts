@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC721/IERC721.hyp";
+
+import "./interfaces/IQurrlNFT.hyp";
+import "./interfaces/IQurrlTraitRegistry.hyp";
+import "./utils/QurrlErrors.hyp";
+
+/**
+ * Read-only aggregator for the Qurrl frontend.
+ *
+ * The collection state a mint screen needs is spread over the NFT, the trait
+ * registry and ERC721 itself. Joining it here turns a card render from eight
+ * `qrl_call` round trips into one, which matters more on QRL than on Ethereum:
+ * the public RPC proxy rate-limits requests, and the wallet extension serialises
+ * them.
+ *
+ * Nothing here is stateful and no contract holds a role on it. Deploying a new
+ * Lens is always safe; it can never invalidate collection state.
+ */
+contract QurrlLens {
+    IQurrlNFT public immutable qurrl;
+    IQurrlTraitRegistry public immutable traitRegistry;
+
+    struct TokenView {
+        uint256 tokenId;
+        address owner;
+        uint16 seasonId;
+        uint16 generation;
+        bool traitsLocked;
+        bool revealed;
+        uint32 lockedFrom;
+        uint8[6] traits;
+        uint8 refineCount;
+    }
+
+    struct CollectionView {
+        uint256 maxSupply;
+        uint32 totalMinted;
+        uint32 totalBurned;
+        uint32 circulating;
+        uint32 remaining;
+        uint32 allocated;
+        uint16 activeSeason;
+        uint16 seasonCount;
+        bool paletteFrozen;
+    }
+
+    constructor(address nft, address registry) {
+        if (nft == address(0) || registry == address(0)) revert ZeroAddress();
+        qurrl = IQurrlNFT(nft);
+        traitRegistry = IQurrlTraitRegistry(registry);
+    }
+
+    /**
+     * Everything one card needs.
+     *
+     * `owner` is `address(0)` for a token that has been fused away. The record
+     * outlives the token deliberately, so a burned parent still resolves and a
+     * lineage stays walkable; reporting a zero owner is how the caller tells
+     * the two states apart without a second call that would revert.
+     */
+    function tokenView(uint256 tokenId) public view returns (TokenView memory view_) {
+        IQurrlNFT.TokenRecord memory record = qurrl.recordOf(tokenId);
+        (uint8[6] memory traits, bool revealed) = qurrl.traitsOf(tokenId);
+
+        view_ = TokenView({
+            tokenId: tokenId,
+            owner: _ownerOrZero(tokenId),
+            seasonId: record.seasonId,
+            generation: record.generation,
+            traitsLocked: record.traitsLocked,
+            revealed: revealed,
+            lockedFrom: record.lockedFrom,
+            traits: traits,
+            refineCount: record.refineCount
+        });
+    }
+
+    function tokenViews(uint256[] calldata tokenIds) external view returns (TokenView[] memory out) {
+        out = new TokenView[](tokenIds.length);
+        for (uint256 i = 0; i < tokenIds.length; ++i) {
+            out[i] = tokenView(tokenIds[i]);
+        }
+    }
+
+    /**
+     * Token ids held by `owner` within `[fromId, toId]`.
+     *
+     * A linear scan rather than ERC721Enumerable: enumeration would add a
+     * per-transfer storage write to every token in a 10,500-supply collection
+     * to serve a read that only ever happens off-chain, and the whole id space
+     * fits comfortably in one `qrl_call`. Callers page with the bounds.
+     */
+    function tokensOfOwner(address owner, uint256 fromId, uint256 toId)
+        external
+        view
+        returns (uint256[] memory tokenIds)
+    {
+        uint256 ceiling = qurrl.totalMinted();
+        if (toId > ceiling) toId = ceiling;
+        if (fromId == 0) fromId = 1;
+
+        uint256 found = 0;
+        uint256[] memory scratch = new uint256[](toId >= fromId ? toId - fromId + 1 : 0);
+
+        for (uint256 id = fromId; id <= toId; ++id) {
+            if (_ownerOrZero(id) == owner) {
+                scratch[found] = id;
+                ++found;
+            }
+        }
+
+        tokenIds = new uint256[](found);
+        for (uint256 i = 0; i < found; ++i) {
+            tokenIds[i] = scratch[i];
+        }
+    }
+
+    function collectionView() external view returns (CollectionView memory) {
+        return
+            CollectionView({
+                maxSupply: 10500,
+                totalMinted: qurrl.totalMinted(),
+                totalBurned: qurrl.totalBurned(),
+                circulating: qurrl.totalMinted() - qurrl.totalBurned(),
+                remaining: uint32(10500) - qurrl.totalMinted(),
+                allocated: qurrl.allocatedSupply(),
+                activeSeason: qurrl.activeSeason(),
+                seasonCount: qurrl.seasonCount(),
+                paletteFrozen: traitRegistry.paletteFrozen()
+            });
+    }
+
+    /// Season config, counters and reveal state in one call.
+    function seasonView(uint16 seasonId)
+        external
+        view
+        returns (IQurrlNFT.SeasonView memory season, bool seedCommitted, bool seedRevealed)
+    {
+        season = qurrl.seasonView(seasonId);
+        seedCommitted = traitRegistry.hasCommitment(seasonId);
+        seedRevealed = traitRegistry.isRevealed(seasonId);
+    }
+
+    /// Variant count per slot. Names are not on chain; see CLAUDE.md "Trait confidentiality".
+    function paletteView() external view returns (uint8[6] memory variants) {
+        variants = traitRegistry.palette();
+    }
+
+    /**
+     * Walks `lockedFrom` (parent A of each fusion) back to a primary mint.
+     *
+     * Only the kept side of each fusion is recorded, so this is the trait
+     * lineage, not the full family tree: the sacrificed parents are recoverable
+     * from `Fused` events, not from storage.
+     */
+    function lineageOf(uint256 tokenId, uint256 maxDepth) external view returns (uint256[] memory chain) {
+        uint256[] memory scratch = new uint256[](maxDepth);
+        uint256 depth = 0;
+        uint256 cursor = tokenId;
+
+        while (depth < maxDepth) {
+            scratch[depth] = cursor;
+            ++depth;
+
+            IQurrlNFT.TokenRecord memory record = qurrl.recordOf(cursor);
+            if (record.lockedFrom == 0) break;
+            cursor = record.lockedFrom;
+        }
+
+        chain = new uint256[](depth);
+        for (uint256 i = 0; i < depth; ++i) {
+            chain[i] = scratch[i];
+        }
+    }
+
+    /// `ownerOf` reverts for a burned token; the frontend needs a value instead.
+    function _ownerOrZero(uint256 tokenId) private view returns (address) {
+        try IERC721(address(qurrl)).ownerOf(tokenId) returns (address owner) {
+            return owner;
+        } catch {
+            return address(0);
+        }
+    }
+}

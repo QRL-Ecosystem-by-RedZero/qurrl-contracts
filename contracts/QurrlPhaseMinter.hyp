@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+import "./lib/openzeppelin/utils/cryptography/MerkleProof.hyp";
+
+import "./interfaces/IArkPhase.hyp";
+import "./interfaces/IQurrlNFT.hyp";
+import "./interfaces/IQurrlTraitRegistry.hyp";
+import "./interfaces/IQurrlPhaseMinter.hyp";
+import "./utils/QurrlErrors.hyp";
+
+/**
+ * Qurrl primary issuance, one row per ecosystem phase (QuantumArk-Phases.md §5).
+ *
+ * PHASES AND SEASONS
+ * ------------------
+ * Phase p is collection season p + 1. A phase opens when the ecosystem has reached
+ * it (`IArkPhase.phase() >= p`) and the previous season's last window has closed;
+ * anyone may call `openPhase`, which configures the season from the row fixed at
+ * deployment and activates it. Phases open in order, so an ecosystem that jumps
+ * (a Q-Day declaration lands while the collection is in phase 1) catches up one
+ * season at a time. This contract must be the only holder of the collection's
+ * `SEASON_ADMIN_ROLE`: the phase is read from the collection's season count.
+ *
+ * The mint window runs from the opening for `mintDuration`, cut short at the
+ * season's `revealNotBefore`, so a late opening shortens the window instead of
+ * colliding with a seed the curator committed write-once. The fusion window
+ * opens at `revealNotBefore` and lasts `fusionDuration`.
+ *
+ * THE POOLS
+ * ---------
+ * Phase 0: a whitelist the deployer sets ONCE (`setGenesis`), free, `perWallet`
+ * tokens per listed address. Leaf = keccak256(keccak256(abi.encodePacked(account))).
+ *
+ * From phase 1, side by side in the mint window:
+ *  - Acorn pool: an address proves its cumulative earned Acorn points against the
+ *    root the Acorn oracle posts each epoch, and spends `reqPts` per token. Spent
+ *    points are recorded here; tiers and RepScore read EARNED points, so spending
+ *    never lowers a score. Leaf = keccak256(keccak256(abi.encodePacked(account, uint64 earned))).
+ *  - QRL pool: `mintFee` per token in native QRL, `walletLimit` tokens per address.
+ *    The value is forwarded to the collection, whose `withdraw` the revenue splitter
+ *    holds, so mint revenue follows the same split as fusion fees.
+ *
+ * WHO TUNES WHAT
+ * --------------
+ *  - owner: `reqPts` and `mintFee` of the phase in force, inside the row's bounds,
+ *    at most once per `OWNER_COOLDOWN` each. A new phase resets the cooldown.
+ *  - governance (the ecosystem timelock once Qurrl has rows there): any cell of any
+ *    row by keyed compare-and-swap, key = keyOf(field, phase); the
+ *    owner, the Acorn oracle and governance itself. A cell the collection already
+ *    holds (caps, fusion fee, durations of an opened phase) is closed to it.
+ */
+contract QurrlPhaseMinter is IQurrlPhaseMinter, ReentrancyGuard {
+    uint8 public constant PHASES = 5;
+    uint64 public constant OWNER_COOLDOWN = 7 days;
+    uint256 private constant FIELDS = 14;
+    /// Ceiling on the lock base fee: the sixth paid lock costs 32x and a full set 63x.
+    uint128 public constant MAX_LOCK_BASE_FEE = 4_000_000_000_000_000_000;
+
+    IQurrlNFT public immutable nft;
+    IQurrlTraitRegistry public immutable traitRegistry;
+    IArkPhase public immutable arkPhase;
+    /// Sets the phase 0 whitelist, once. Holds nothing else.
+    address public immutable deployer;
+
+    PhaseRow[5] private _rows;
+
+    address public governance;
+    address public pendingGovernance;
+    address public owner;
+    address public acornOracle;
+
+    bytes32 public genesisRoot;
+    uint16 public genesisPerWallet;
+
+    bytes32 public acornRoot;
+    uint64 public acornEpoch;
+
+    uint64 public reqPtsNextAt;
+    uint64 public mintFeeNextAt;
+
+    mapping(uint8 => uint32) private _acornMinted;
+    mapping(uint8 => uint32) private _qrlMinted;
+    mapping(uint8 => mapping(address => uint32)) private _qrlMintedBy;
+    mapping(address => uint32) private _genesisMinted;
+    mapping(address => uint64) private _spent;
+
+    error NotDeployer();
+    error NotOwner();
+    error NotGovernance();
+    error NotPending();
+    error NotAcornOracle();
+    error GenesisAlreadySet();
+    error GenesisNotSet();
+    error InvalidGenesis();
+    error AllPhasesOpened();
+    error PhaseNotReached(uint8 required, uint8 current);
+    error PreviousPhaseOpen(uint16 seasonId, uint64 endsAt);
+    error NoPhaseOpen();
+    error WrongPhase(uint8 current);
+    error PoolSoldOut(uint8 phase);
+    error InsufficientAcorns(uint64 available, uint64 required);
+    error AcornEpochNotNewer(uint64 current, uint64 provided);
+    error OutOfBounds(uint256 value, uint256 min, uint256 max);
+    error OwnerCooldown(uint64 until);
+    error InvalidRow(uint8 phase);
+    error UnknownKey(bytes32 key);
+    error ParamMismatch(bytes32 key, uint256 expected, uint256 actual);
+    error PhaseAlreadyOpened(uint8 phase);
+
+    constructor(
+        address nft_,
+        address registry_,
+        address arkPhase_,
+        address governance_,
+        address owner_,
+        address acornOracle_,
+        PhaseRow[5] memory rows
+    ) {
+        if (
+            nft_ == address(0) || registry_ == address(0) || arkPhase_ == address(0) || governance_ == address(0)
+                || owner_ == address(0) || acornOracle_ == address(0)
+        ) revert ZeroAddress();
+
+        nft = IQurrlNFT(nft_);
+        traitRegistry = IQurrlTraitRegistry(registry_);
+        arkPhase = IArkPhase(arkPhase_);
+        deployer = msg.sender;
+        governance = governance_;
+        owner = owner_;
+        acornOracle = acornOracle_;
+
+        uint256 total = 0;
+        for (uint8 p = 0; p < PHASES; ++p) {
+            _rows[p] = rows[p];
+            _checkRow(p);
+            total += uint256(rows[p].acornCap) + rows[p].qrlCap + rows[p].fusionCap;
+        }
+        // The collection enforces the ceiling at configuration; refusing a schedule that
+        // could never be configured in full is cheaper here than in phase 4.
+        if (total > 10500) revert AllocationExceeded(total, 10500);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Phase 0 whitelist                                                  */
+    /* ----------------------------------------------------------------- */
+
+    /// Once, by the deployer, before phase 0 opens. The list is built off chain from the Acorn snapshot.
+    function setGenesis(bytes32 root, uint16 perWallet) external {
+        if (msg.sender != deployer) revert NotDeployer();
+        if (genesisRoot != bytes32(0)) revert GenesisAlreadySet();
+        if (nft.seasonCount() != 0) revert PhaseAlreadyOpened(0);
+        if (root == bytes32(0) || perWallet == 0 || perWallet > _rows[0].acornCap) revert InvalidGenesis();
+
+        genesisRoot = root;
+        genesisPerWallet = perWallet;
+        emit GenesisSet(root, perWallet);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Opening a phase                                                    */
+    /* ----------------------------------------------------------------- */
+
+    function openPhase() external nonReentrant returns (uint16 seasonId) {
+        uint16 count = nft.seasonCount();
+        if (count >= PHASES) revert AllPhasesOpened();
+        uint8 p = uint8(count);
+
+        uint8 ecosystem = arkPhase.phase();
+        if (ecosystem < p) revert PhaseNotReached(p, ecosystem);
+        if (p == 0 && genesisRoot == bytes32(0)) revert GenesisNotSet();
+
+        if (count != 0) {
+            IQurrlNFT.SeasonConfig memory prev = nft.seasonView(count).config;
+            uint64 endsAt = prev.fusionCap != 0 ? prev.fusionClosesAt : prev.closesAt;
+            if (block.timestamp < endsAt) revert PreviousPhaseOpen(count, endsAt);
+        }
+
+        seasonId = count + 1;
+        if (!traitRegistry.hasCommitment(seasonId)) revert SeedNotCommitted(seasonId);
+        uint64 revealAt = traitRegistry.revealNotBeforeOf(seasonId);
+        if (revealAt <= block.timestamp) revert WindowAlreadyOver(revealAt);
+
+        PhaseRow storage row = _rows[p];
+        uint64 closesAt = uint64(block.timestamp) + row.mintDuration;
+        if (closesAt > revealAt) closesAt = revealAt;
+
+        nft.configureSeason(
+            seasonId,
+            IQurrlNFT.SeasonConfig({
+                primaryCap: row.acornCap + row.qrlCap,
+                fusionCap: row.fusionCap,
+                opensAt: uint64(block.timestamp),
+                closesAt: closesAt,
+                fusionOpensAt: revealAt,
+                fusionClosesAt: revealAt + row.fusionDuration,
+                fusionFee: row.fusionFee,
+                lockBaseFee: row.lockBaseFee
+            })
+        );
+        nft.setActiveSeason(seasonId);
+
+        reqPtsNextAt = 0;
+        mintFeeNextAt = 0;
+        emit PhaseOpened(p, seasonId, closesAt, revealAt);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Pools                                                              */
+    /* ----------------------------------------------------------------- */
+
+    function mintGenesis(uint32 quantity, bytes32[] calldata proof) external nonReentrant {
+        uint8 p = _phaseInForce();
+        if (p != 0) revert WrongPhase(p);
+
+        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encodePacked(msg.sender))));
+        if (!MerkleProof.verify(proof, genesisRoot, leaf)) revert InvalidMerkleProof();
+
+        uint32 taken = _genesisMinted[msg.sender];
+        if (taken + quantity > genesisPerWallet) revert WalletLimitReached(genesisPerWallet, taken);
+        _genesisMinted[msg.sender] = taken + quantity;
+        _takeAcornPool(0, quantity);
+
+        nft.mintTo(msg.sender, quantity);
+        emit GenesisMinted(msg.sender, quantity);
+    }
+
+    function mintAcorn(uint32 quantity, uint64 earned, bytes32[] calldata proof) external nonReentrant {
+        uint8 p = _phaseInForce();
+        if (p == 0) revert WrongPhase(p);
+
+        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encodePacked(msg.sender, earned))));
+        if (!MerkleProof.verify(proof, acornRoot, leaf)) revert InvalidMerkleProof();
+
+        uint64 cost = uint64(_rows[p].reqPts) * quantity;
+        uint64 spent = _spent[msg.sender];
+        uint64 available = earned > spent ? earned - spent : 0;
+        if (available < cost) revert InsufficientAcorns(available, cost);
+        _spent[msg.sender] = spent + cost;
+        _takeAcornPool(p, quantity);
+
+        nft.mintTo(msg.sender, quantity);
+        emit AcornMinted(msg.sender, quantity, cost);
+    }
+
+    function mintQrl(uint32 quantity) external payable nonReentrant {
+        uint8 p = _phaseInForce();
+        PhaseRow storage row = _rows[p];
+
+        uint256 due = uint256(row.mintFee) * quantity;
+        if (msg.value != due) revert IncorrectPayment(due, msg.value);
+
+        uint32 taken = _qrlMintedBy[p][msg.sender];
+        if (row.walletLimit != 0 && taken + quantity > row.walletLimit) revert WalletLimitReached(row.walletLimit, taken);
+        uint32 minted = _qrlMinted[p];
+        if (minted + quantity > row.qrlCap) revert PoolSoldOut(p);
+
+        _qrlMintedBy[p][msg.sender] = taken + quantity;
+        _qrlMinted[p] = minted + quantity;
+
+        nft.mintTo{value: msg.value}(msg.sender, quantity);
+        emit QrlMinted(msg.sender, quantity, msg.value);
+    }
+
+    /// One root per epoch, epochs strictly increasing. Each leaf carries cumulative earned points.
+    function postAcornRoot(uint64 epoch, bytes32 root) external {
+        if (msg.sender != acornOracle) revert NotAcornOracle();
+        if (epoch <= acornEpoch) revert AcornEpochNotNewer(acornEpoch, epoch);
+        acornEpoch = epoch;
+        acornRoot = root;
+        emit AcornRootPosted(epoch, root);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Owner: the phase in force, inside its bounds                       */
+    /* ----------------------------------------------------------------- */
+
+    function setReqPts(uint32 next) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (block.timestamp < reqPtsNextAt) revert OwnerCooldown(reqPtsNextAt);
+        uint8 p = _phaseInForce();
+        PhaseRow storage row = _rows[p];
+        if (next < row.reqPtsMin || next > row.reqPtsMax) revert OutOfBounds(next, row.reqPtsMin, row.reqPtsMax);
+
+        emit ReqPtsSet(p, row.reqPts, next);
+        row.reqPts = next;
+        reqPtsNextAt = uint64(block.timestamp) + OWNER_COOLDOWN;
+    }
+
+    function setMintFee(uint128 next) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (block.timestamp < mintFeeNextAt) revert OwnerCooldown(mintFeeNextAt);
+        uint8 p = _phaseInForce();
+        PhaseRow storage row = _rows[p];
+        if (next < row.mintFeeMin || next > row.mintFeeMax) revert OutOfBounds(next, row.mintFeeMin, row.mintFeeMax);
+
+        emit MintFeeSet(p, row.mintFee, next);
+        row.mintFee = next;
+        mintFeeNextAt = uint64(block.timestamp) + OWNER_COOLDOWN;
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Governance                                                         */
+    /* ----------------------------------------------------------------- */
+
+    /**
+     * Keyed compare-and-swap over the rows, the shape the ecosystem timelock schedules.
+     * Every change is checked against the value in force, and the touched rows are
+     * re-checked as a whole, so a draft that breaks a bound or a relation fails entirely.
+     */
+    function setParamsDiff(ParamChange[] calldata changes) external {
+        if (msg.sender != governance) revert NotGovernance();
+        uint16 opened = nft.seasonCount();
+
+        for (uint256 i = 0; i < changes.length; ++i) {
+            (uint256 f, uint8 p) = _decodeKey(changes[i].key);
+            // Caps, fusion fee and durations of an opened phase are already in the collection.
+            if (p < opened && f != 3 && f != 4 && f != 5 && f != 6 && f != 7 && f != 8 && f != 10) {
+                revert PhaseAlreadyOpened(p);
+            }
+            uint256 current = _get(_rows[p], f);
+            if (current != changes[i].expected) revert ParamMismatch(changes[i].key, changes[i].expected, current);
+            _set(_rows[p], f, changes[i].value);
+            emit ParamChanged(changes[i].key, current, changes[i].value);
+        }
+        for (uint256 i = 0; i < changes.length; ++i) {
+            (, uint8 p) = _decodeKey(changes[i].key);
+            _checkRow(p);
+        }
+    }
+
+    function setOwner(address next) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (next == address(0)) revert ZeroAddress();
+        owner = next;
+        emit OwnerSet(next);
+    }
+
+    function setAcornOracle(address next) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (next == address(0)) revert ZeroAddress();
+        acornOracle = next;
+        emit AcornOracleSet(next);
+    }
+
+    function proposeGovernance(address next) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (next == address(0)) revert ZeroAddress();
+        pendingGovernance = next;
+        emit GovernanceProposed(next);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPending();
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(msg.sender);
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Views                                                              */
+    /* ----------------------------------------------------------------- */
+
+    function rowOf(uint8 phase) external view returns (PhaseRow memory) {
+        if (phase >= PHASES) revert InvalidRow(phase);
+        return _rows[phase];
+    }
+
+    function currentPhase() public view returns (bool opened, uint8 phase) {
+        uint16 count = nft.seasonCount();
+        if (count == 0) return (false, 0);
+        return (true, uint8(count - 1));
+    }
+
+    /// (Acorn pool, QRL pool) minted in `phase`.
+    function poolMinted(uint8 phase) external view returns (uint32 acorn, uint32 qrl) {
+        return (_acornMinted[phase], _qrlMinted[phase]);
+    }
+
+    function qrlMintedBy(uint8 phase, address account) external view returns (uint32) {
+        return _qrlMintedBy[phase][account];
+    }
+
+    function genesisMintedBy(address account) external view returns (uint32) {
+        return _genesisMinted[account];
+    }
+
+    function acornsSpent(address account) external view returns (uint64) {
+        return _spent[account];
+    }
+
+    /// keccak256 of the field name, an at-sign and the phase digit, e.g. for reqPts of phase 2.
+    function keyOf(uint256 field, uint8 phase) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(_fieldName(field), "@", bytes1(uint8(48) + phase)));
+    }
+
+    /* ----------------------------------------------------------------- */
+    /* Internals                                                          */
+    /* ----------------------------------------------------------------- */
+
+    function _phaseInForce() private view returns (uint8) {
+        (bool opened, uint8 phase) = currentPhase();
+        if (!opened) revert NoPhaseOpen();
+        return phase;
+    }
+
+    function _takeAcornPool(uint8 p, uint32 quantity) private {
+        uint32 minted = _acornMinted[p];
+        if (minted + quantity > _rows[p].acornCap) revert PoolSoldOut(p);
+        _acornMinted[p] = minted + quantity;
+    }
+
+    function _checkRow(uint8 p) private view {
+        PhaseRow storage r = _rows[p];
+        if (
+            r.reqPtsMin > r.reqPts || r.reqPts > r.reqPtsMax || r.mintFeeMin > r.mintFee || r.mintFee > r.mintFeeMax
+                || r.acornCap + r.qrlCap + r.fusionCap == 0 || r.mintDuration == 0
+                || (r.fusionCap != 0 && r.fusionDuration == 0) || r.lockBaseFee > MAX_LOCK_BASE_FEE
+        ) revert InvalidRow(p);
+    }
+
+    function _decodeKey(bytes32 key) private pure returns (uint256 field, uint8 phase) {
+        for (uint256 f = 0; f < FIELDS; ++f) {
+            for (uint8 p = 0; p < PHASES; ++p) {
+                if (keyOf(f, p) == key) return (f, p);
+            }
+        }
+        revert UnknownKey(key);
+    }
+
+    function _fieldName(uint256 f) private pure returns (bytes memory) {
+        if (f == 0) return "acornCap";
+        if (f == 1) return "qrlCap";
+        if (f == 2) return "fusionCap";
+        if (f == 3) return "reqPts";
+        if (f == 4) return "reqPtsMin";
+        if (f == 5) return "reqPtsMax";
+        if (f == 6) return "mintFee";
+        if (f == 7) return "mintFeeMin";
+        if (f == 8) return "mintFeeMax";
+        if (f == 9) return "fusionFee";
+        if (f == 10) return "walletLimit";
+        if (f == 11) return "mintDuration";
+        if (f == 12) return "fusionDuration";
+        if (f == 13) return "lockBaseFee";
+        return "";
+    }
+
+    function _get(PhaseRow storage r, uint256 f) private view returns (uint256) {
+        if (f == 0) return r.acornCap;
+        if (f == 1) return r.qrlCap;
+        if (f == 2) return r.fusionCap;
+        if (f == 3) return r.reqPts;
+        if (f == 4) return r.reqPtsMin;
+        if (f == 5) return r.reqPtsMax;
+        if (f == 6) return r.mintFee;
+        if (f == 7) return r.mintFeeMin;
+        if (f == 8) return r.mintFeeMax;
+        if (f == 9) return r.fusionFee;
+        if (f == 10) return r.walletLimit;
+        if (f == 11) return r.mintDuration;
+        if (f == 12) return r.fusionDuration;
+        return r.lockBaseFee;
+    }
+
+    function _set(PhaseRow storage r, uint256 f, uint256 v) private {
+        uint256 max = f == 10 ? type(uint16).max : (f >= 6 && f <= 9) || f == 13 ? type(uint128).max : type(uint32).max;
+        if (v > max) revert OutOfBounds(v, 0, max);
+        if (f == 0) r.acornCap = uint32(v);
+        else if (f == 1) r.qrlCap = uint32(v);
+        else if (f == 2) r.fusionCap = uint32(v);
+        else if (f == 3) r.reqPts = uint32(v);
+        else if (f == 4) r.reqPtsMin = uint32(v);
+        else if (f == 5) r.reqPtsMax = uint32(v);
+        else if (f == 6) r.mintFee = uint128(v);
+        else if (f == 7) r.mintFeeMin = uint128(v);
+        else if (f == 8) r.mintFeeMax = uint128(v);
+        else if (f == 9) r.fusionFee = uint128(v);
+        else if (f == 10) r.walletLimit = uint16(v);
+        else if (f == 11) r.mintDuration = uint32(v);
+        else if (f == 12) r.fusionDuration = uint32(v);
+        else r.lockBaseFee = uint128(v);
+    }
+}

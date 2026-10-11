@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/access/AccessControl.hyp";
+
+import "./interfaces/IQurrlTraitRegistry.hyp";
+import "./utils/QurrlErrors.hyp";
+
+/**
+ * Trait palette and per-season reveal seeds.
+ *
+ * A Qurrl's six traits are not stored: they are a pure function of
+ * `keccak256(effectiveSeed, tokenId)`. The effective seed is
+ *
+ *     keccak256(curatorSeed, entropy)
+ *
+ * where `curatorSeed` was committed before the season opened and `entropy` is
+ * taken from the block that reveals it. Neither half alone fixes a trait:
+ *
+ *   - the curator knows `curatorSeed` from day one and still cannot tell which
+ *     token ids will be rare, so cannot steer their own mints or buy ahead;
+ *   - nobody can compute `entropy` before the reveal block, so neither can a
+ *     minter or a validator planning around the curator's transaction.
+ *
+ * `keccak256` commit-reveal needs no signature scheme, which matters because
+ * `ecrecover` does not exist on Zond.
+ *
+ * REVEAL TIMING IS IN THE CODE, NOT IN A PROCESS
+ * ----------------------------------------------
+ * `commitSeed` fixes `revealNotBefore`, and `QurrlNFT.configureSeason` refuses
+ * a season whose window closes after it. So the curator cannot reveal while
+ * minting is still open. If the curator does not reveal within REVEAL_WINDOW of
+ * that moment, anyone may call `revealDefault`, which uses the entropy alone:
+ * the curator's one remaining power is to reveal late, never to withhold. The curator
+ * cannot reveal after that window either, so a default and a late reveal never race.
+ *
+ * RARITY IS A DESIGN INPUT
+ * ------------------------
+ * Each slot has a weight per variant, in basis points summing to 10,000, stored
+ * as a cumulative table. The palette seals once and the weights seal with it:
+ * changing a weight after a reveal would silently re-rarity tokens already
+ * minted. Counts are statistical, not exact: a variant with weight 100 (1%)
+ * appears about 105 times in 10,500, give or take roughly 10.
+ *
+ * The registry holds no names. See IQurrlTraitRegistry.
+ */
+contract QurrlTraitRegistry is IQurrlTraitRegistry, AccessControl {
+    /// Commits and reveals season seeds, and edits the palette while it is open.
+    bytes32 public constant CURATOR_ROLE = keccak256("CURATOR_ROLE");
+
+    uint256 public constant TRAIT_SLOTS = 6;
+    uint256 public constant MAX_VARIANTS = 32;
+    uint32 public constant WEIGHT_TOTAL = 10_000;
+
+    /// How long after `revealNotBefore` the curator has to reveal. After it the curator can
+    /// no longer reveal and anyone may default the season; before it nobody can.
+    uint64 public constant REVEAL_WINDOW = 14 days;
+
+    /// The furthest a reveal may be scheduled past the commit. Without a bound a curator could
+    /// commit a date so far away that `revealDefault` never becomes callable.
+    uint64 public constant MAX_REVEAL_HORIZON = 400 days;
+
+    struct Seed {
+        bytes32 commitment;
+        bytes32 seed;
+        uint64 revealNotBefore;
+        bool revealed;
+    }
+
+    uint8[6] private _variantCounts;
+    /// Cumulative weights: `_cum[slot][j]` is the sum of weights 0..j. The last one is WEIGHT_TOTAL.
+    uint16[32][6] private _cum;
+    bool private _paletteFrozen;
+
+    mapping(uint16 => Seed) private _seeds;
+
+    /// Hash of the off-chain manifest: slot and variant names, the art behind each index.
+    bytes32 private _manifest;
+
+    constructor(address admin) {
+        if (admin == address(0)) revert ZeroAddress();
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(CURATOR_ROLE, admin);
+    }
+
+    /**
+     * Declares a slot's variants by weight; the number of weights is the number
+     * of variants. Irreversible once `sealPalette` runs, because the weights are
+     * the thresholds in `deriveTraits`.
+     */
+    function setCategory(uint256 slot, uint16[] calldata weights) external onlyRole(CURATOR_ROLE) {
+        if (_paletteFrozen) revert PaletteFrozen();
+        if (slot >= TRAIT_SLOTS) revert UnknownTraitSlot(slot);
+
+        uint256 n = weights.length;
+        if (n == 0 || n > MAX_VARIANTS) revert InvalidVariantCount(slot);
+
+        uint32 running = 0;
+        for (uint256 j = 0; j < n; ++j) {
+            if (weights[j] == 0) revert InvalidWeights(slot);
+            running += weights[j];
+            if (running > WEIGHT_TOTAL) revert InvalidWeights(slot);
+            _cum[slot][j] = uint16(running);
+        }
+        if (running != WEIGHT_TOTAL) revert InvalidWeights(slot);
+
+        _variantCounts[slot] = uint8(n);
+        emit PaletteUpdated(slot, uint8(n));
+    }
+
+    /**
+     * Commits to the manifest that says what every slot and variant index IS: names and art
+     * hashes, kept off chain until the reveal. The chain only knows indices, so without this
+     * the project could assign its best art to the variants it holds after seeing who got
+     * what. Write-once, and required before any season seed can be committed.
+     */
+    function commitManifest(bytes32 manifestHash) external onlyRole(CURATOR_ROLE) {
+        if (manifestHash == bytes32(0)) revert ManifestInvalid();
+        if (_manifest != bytes32(0)) revert ManifestAlreadyCommitted();
+        _manifest = manifestHash;
+        emit ManifestCommitted(manifestHash);
+    }
+
+    /// Irreversible. `QurrlNFT.configureSeason` refuses to run until this has.
+    function sealPalette() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_paletteFrozen) revert PaletteFrozen();
+        for (uint256 i = 0; i < TRAIT_SLOTS; ++i) {
+            if (_variantCounts[i] == 0) revert InvalidVariantCount(i);
+        }
+        _paletteFrozen = true;
+        emit PaletteSealed(block.timestamp);
+    }
+
+    /**
+     * `commitment` must be `keccak256(abi.encodePacked(seasonId, seed))`. Write-once.
+     * Every preimage in this contract is `encodePacked` of fixed-width types, so it
+     * is the same bytes on the 32-byte-word line and on QIP-55, where `abi.encode`
+     * would pad each value to 64 bytes and no off-chain twin could match both.
+     * `revealNotBefore` must lie in the future; `QurrlNFT.configureSeason`
+     * additionally requires it to be at or after the season's close.
+     */
+    function commitSeed(uint16 seasonId, bytes32 commitment, uint64 revealNotBefore)
+        external
+        onlyRole(CURATOR_ROLE)
+    {
+        if (_manifest == bytes32(0)) revert ManifestNotCommitted();
+        if (commitment == bytes32(0)) revert SeedMismatch(commitment);
+        if (_seeds[seasonId].commitment != bytes32(0)) revert SeedAlreadyCommitted(seasonId);
+        if (revealNotBefore <= block.timestamp || revealNotBefore > block.timestamp + MAX_REVEAL_HORIZON) {
+            revert RevealTimeInvalid(revealNotBefore);
+        }
+
+        _seeds[seasonId].commitment = commitment;
+        _seeds[seasonId].revealNotBefore = revealNotBefore;
+        emit SeedCommitted(seasonId, commitment, revealNotBefore);
+    }
+
+    function revealSeed(uint16 seasonId, bytes32 seed) external onlyRole(CURATOR_ROLE) {
+        Seed storage entry = _seeds[seasonId];
+        if (entry.commitment == bytes32(0)) revert SeedNotCommitted(seasonId);
+        if (entry.revealed) revert SeedAlreadyRevealed(seasonId);
+        if (block.timestamp < entry.revealNotBefore) revert RevealTooEarly(seasonId, entry.revealNotBefore);
+        if (block.timestamp >= entry.revealNotBefore + REVEAL_WINDOW) revert RevealWindowClosed(seasonId);
+        if (keccak256(abi.encodePacked(seasonId, seed)) != entry.commitment) revert SeedMismatch(entry.commitment);
+
+        _finish(seasonId, entry, seed, false);
+    }
+
+    /// Anyone, once the curator has missed the window. Uses the block entropy alone.
+    function revealDefault(uint16 seasonId) external {
+        Seed storage entry = _seeds[seasonId];
+        if (entry.commitment == bytes32(0)) revert SeedNotCommitted(seasonId);
+        if (entry.revealed) revert SeedAlreadyRevealed(seasonId);
+        uint64 opens = entry.revealNotBefore + REVEAL_WINDOW;
+        if (block.timestamp < opens) revert RevealTooEarly(seasonId, opens);
+
+        _finish(seasonId, entry, bytes32(0), true);
+    }
+
+    function _finish(uint16 seasonId, Seed storage entry, bytes32 curatorSeed, bool defaulted) private {
+        // A chain that returned a constant here would let the curator sample reveals until one suited.
+        if (block.prevrandao == 0) revert EntropyUnavailable();
+        bytes32 entropy = keccak256(abi.encodePacked(block.prevrandao, blockhash(block.number - 1), seasonId));
+        bytes32 effective = keccak256(abi.encodePacked(curatorSeed, entropy));
+
+        entry.seed = effective;
+        entry.revealed = true;
+        emit SeedRevealed(seasonId, curatorSeed, entropy, effective, defaulted);
+    }
+
+    /**
+     * One keccak output supplies all six variant draws, 32 bits each, mapped
+     * onto the slot's cumulative weights. 2^32 mod 10,000 leaves a bias of a few
+     * parts in a million, which is why the draw is 32 bits wide and not 8.
+     */
+    function deriveTraits(uint16 seasonId, uint256 tokenId) external view returns (uint8[6] memory out) {
+        Seed storage entry = _seeds[seasonId];
+        if (!entry.revealed) revert TraitsNotRevealed(seasonId);
+
+        uint256 digest = uint256(keccak256(abi.encodePacked(entry.seed, tokenId)));
+        for (uint256 i = 0; i < TRAIT_SLOTS; ++i) {
+            uint256 draw = uint256(uint32(digest >> (i * 32))) % WEIGHT_TOTAL;
+            uint256 j = 0;
+            while (draw >= _cum[i][j]) ++j;
+            out[i] = uint8(j);
+        }
+    }
+
+    function palette() external view returns (uint8[6] memory) {
+        return _variantCounts;
+    }
+
+    function weightsOf(uint256 slot) external view returns (uint16[] memory out) {
+        if (slot >= TRAIT_SLOTS) revert UnknownTraitSlot(slot);
+        uint256 n = _variantCounts[slot];
+        out = new uint16[](n);
+        uint16 prev = 0;
+        for (uint256 j = 0; j < n; ++j) {
+            out[j] = _cum[slot][j] - prev;
+            prev = _cum[slot][j];
+        }
+    }
+
+    function manifestOf() external view returns (bytes32) {
+        return _manifest;
+    }
+
+    function paletteFrozen() external view returns (bool) {
+        return _paletteFrozen;
+    }
+
+    function hasCommitment(uint16 seasonId) external view returns (bool) {
+        return _seeds[seasonId].commitment != bytes32(0);
+    }
+
+    function isRevealed(uint16 seasonId) external view returns (bool) {
+        return _seeds[seasonId].revealed;
+    }
+
+    function commitmentOf(uint16 seasonId) external view returns (bytes32) {
+        return _seeds[seasonId].commitment;
+    }
+
+    function revealNotBeforeOf(uint16 seasonId) external view returns (uint64) {
+        return _seeds[seasonId].revealNotBefore;
+    }
+
+    /// bytes32(0) until the season is revealed.
+    function seedOf(uint16 seasonId) external view returns (bytes32) {
+        return _seeds[seasonId].seed;
+    }
+}
