@@ -41,9 +41,10 @@ be revealed.
 | `QurrlTraitRegistry` | Six-slot trait palette, per-season seed commit–reveal, deterministic trait derivation |
 | `QurrlNFT` | ERC721, seasons, primary mint, fusion, supply accounting |
 | `QurrlLens` | Stateless read aggregator for the frontend |
-| `QurrlPhaseMinter` | Primary issuance per ecosystem phase: the Phase 0 whitelist, the Acorn pool and the QRL pool |
+| `QurrlPhaseMinter` | Primary issuance per ecosystem phase: the Phase 0 list (three baskets, one wallet one token; `scripts/phase0/select-phase0.js`), the Acorn pool and the QRL pool |
 | `QurrlMetadata` | Token metadata |
 | `QurrlRevenueSplitter` | Divides mint, fusion and secondary revenue between creator, cushion and treasury; each line is pulled by its own claim |
+| `QurrlBudget` | Receives Qurrl's budget from the ecosystem treasury router; pays out only by governance (`payBudget`) |
 
 ## Status
 
