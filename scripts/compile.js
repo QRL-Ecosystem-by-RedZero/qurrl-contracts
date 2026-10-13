@@ -72,7 +72,7 @@ const OUT = path.join(ROOT, `${QRVM ? 'build-qrvm' : 'build'}${SUFFIX}`);
 const ABI_DIR = PROFILE === 'spec' ? path.join(ROOT, QRVM ? 'abi-qrvm' : 'abi') : null;
 
 /** Our own contracts, as opposed to vendored OpenZeppelin. */
-const OWN = ['QurrlTraitRegistry', 'QurrlNFT', 'QurrlLens', 'QurrlMetadata', 'QurrlRevenueSplitter', 'QurrlPhaseMinter'];
+const OWN = ['QurrlTraitRegistry', 'QurrlNFT', 'QurrlLens', 'QurrlMetadata', 'QurrlRevenueSplitter', 'QurrlPhaseMinter', 'QurrlBudget'];
 
 const EIP170_LIMIT = 24576;
 

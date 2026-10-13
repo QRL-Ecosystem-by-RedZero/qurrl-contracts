@@ -57,15 +57,16 @@ const PALETTE = [8, 10, 8, 12, 12, 6].map((variants) => ({ variants, weights: ti
  * circulating supply at that moment; test/Supply.test.js checks this against an
  * independent copy.
  *
- * Phase 0 is the genesis whitelist (`setGenesis`, built off chain from Acorn
- * >= GENESIS_MIN_ACORNS), free. From phase 1, `reqPts` is the Acorn points spent per
+ * Phase 0 is the genesis whitelist (`setGenesis`, one wallet one token), free, built
+ * off chain in three baskets (PHASE0, scripts/phase0/select-phase0.js; adopted 2026-10-13). From phase 1, `reqPts` is the Acorn points spent per
  * token and `mintFee` the QRL price per token; the owner may move either inside
  * [min, max] for the phase in force. Amounts in wei. Durations are PLACEHOLDERS.
  */
 const QRL = 10n ** 18n;
 const MINT_DURATION = 30 * DAY;
 const FUSION_DURATION = 30 * DAY;
-const GENESIS_MIN_ACORNS = 2001;
+/** Phase 0 baskets: 35 direct, 45 top Acorn, 25 raffle (>= 600 Acorn, >= 2 own transactions, sqrt(Acorn)). */
+const PHASE0 = Object.freeze({ direct: 35, top: 45, raffle: 25, raffleFloor: 600, raffleMinTx: 2, perWallet: 1 });
 
 const PHASES = [
   {
@@ -214,7 +215,7 @@ module.exports = {
   PHASE_ROW_FIELDS,
   PHASE_ROWS,
   phaseRowTuple,
-  GENESIS_MIN_ACORNS,
+  PHASE0,
   ZERO32,
   seedFor,
   commitmentFor,

@@ -13,9 +13,16 @@
  *
  * and GOVERNANCE_ADDRESS (a multisig, or the ArkTimelock) holds the rest:
  *
- *   QurrlNFT             DEFAULT_ADMIN, PAUSER
+ *   QurrlNFT             DEFAULT_ADMIN
  *   QurrlTraitRegistry   DEFAULT_ADMIN
  *   QurrlMetadata        DEFAULT_ADMIN
+ *   QurrlPhaseMinter, QurrlRevenueSplitter, QurrlBudget   governance (proposed here; a
+ *                        timelock accepts at once through `acceptGovernanceOf`, a
+ *                        multisig accepts itself)
+ *
+ * PAUSER_ROLE goes to GUARDIAN_ADDRESS when set (2026-10-13): `pause()` has a
+ * seven-day row in the ecosystem timelock, which is no emergency stop, so the
+ * pause sits with the guardian and only the admin role with the timelock.
  *
  * QurrlNFT's TREASURER_ROLE already belongs to QurrlRevenueSplitter, so the
  * deployer's own copy is simply renounced. The minter's own governance, owner
@@ -150,10 +157,32 @@ async function main() {
     return;
   }
 
+  const holderOf = (r) => (r === 'PAUSER_ROLE' && env.GUARDIAN_ADDRESS ? env.GUARDIAN_ADDRESS : governance);
   for (const step of plan) {
     const contract = contractAt(web3, step.name, step.address);
     for (const r of step.grant) {
-      await sendRaw(web3, account, { to: step.address, data: contract.methods.grantRole(hash(r), governance).encodeABI(), gas: 200_000 });
+      await sendRaw(web3, account, { to: step.address, data: contract.methods.grantRole(hash(r), holderOf(r)).encodeABI(), gas: 200_000 });
+    }
+  }
+
+  // The governed contracts: propose, then have a timelock accept at once (OC-GOV-03).
+  const timelockAbi = [{ type: 'function', name: 'acceptGovernanceOf', inputs: [{ name: 'target', type: 'address' }], outputs: [], stateMutability: 'nonpayable' }];
+  const timelock = new web3.qrl.Contract(timelockAbi, governance);
+  for (const name of ['QurrlPhaseMinter', 'QurrlRevenueSplitter', 'QurrlBudget']) {
+    if (!c[name]) continue;
+    const target = contractAt(web3, name, c[name]);
+    const current = await target.methods.governance().call();
+    if (same(current, governance)) continue;
+    if (!same(current, account.address)) {
+      console.log(`   ${name}: governance is ${current}, not this deployer; left alone`);
+      continue;
+    }
+    await sendRaw(web3, account, { to: c[name], data: target.methods.proposeGovernance(governance).encodeABI(), gas: 200_000 });
+    try {
+      await sendRaw(web3, account, { to: governance, data: timelock.methods.acceptGovernanceOf(c[name]).encodeABI(), gas: 300_000 });
+      console.log(`   ${name}: governance -> ${governance} (accepted)`);
+    } catch (e) {
+      console.log(`   ${name}: governance proposed to ${governance}; it must call acceptGovernance() itself (${e.message})`);
     }
   }
   for (const s of strays) {
@@ -170,7 +199,7 @@ async function main() {
   for (const step of plan) {
     const contract = contractAt(web3, step.name, step.address);
     for (const r of step.grant) {
-      assert.equal(await contract.methods.hasRole(hash(r), governance).call(), true, `${step.name} ${r}: governance missing`);
+      assert.equal(await contract.methods.hasRole(hash(r), holderOf(r)).call(), true, `${step.name} ${r}: ${holderOf(r)} missing`);
     }
     for (const r of step.renounce) {
       assert.equal(await contract.methods.hasRole(hash(r), account.address).call(), false, `${step.name} ${r}: deployer still holds it`);

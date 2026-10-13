@@ -16,11 +16,15 @@
  *     DEFAULT_ADMIN_ROLE -> deployer                  (URIs, freeze)
  *   QurrlRevenueSplitter
  *     TREASURER_ROLE on QurrlNFT, royalty receiver
+ *     governance         -> deployer, until `npm run handover` (wiring is one-shot governance)
+ *     treasury           -> TREASURY_ROUTER_ADDRESS when set (ArkTreasuryRouter, once)
+ *   QurrlBudget
+ *     the QURRL_BUDGET lane (Treasury-Flows §7); governance -> deployer, until handover
  *   QurrlLens
  *     no roles, no state, holds nothing
  *   QurrlPhaseMinter
  *     deployer           -> the deploying account     (setGenesis, once)
- *     governance         -> GOVERNANCE_ADDRESS or deployer
+ *     governance         -> deployer, until handover moves it to GOVERNANCE_ADDRESS
  *     owner              -> MINTER_OWNER_ADDRESS or deployer   (reqPts, mintFee)
  *     acornOracle        -> ACORN_ORACLE_ADDRESS or deployer   (postAcornRoot)
  *     arkPhase           -> ARK_PHASE_ADDRESS, else a fresh ArkPhaseDouble (stand-in)
@@ -113,7 +117,9 @@ async function main() {
   console.log(`QurrlMetadata       ${metadataAddress}`);
 
   const creator = env.CREATOR_ADDRESS || account.address;
-  const governance = env.GOVERNANCE_ADDRESS || account.address;
+  // Every governed contract starts on the deployer: the splitter's wiring is one-shot
+  // governance, and `npm run handover` moves all of them to GOVERNANCE_ADDRESS at once.
+  const governance = account.address;
   const splitter = await deploy(web3, account, 'QurrlRevenueSplitter', [
     nftAddress,
     creator,
@@ -123,6 +129,15 @@ async function main() {
   ]);
   const splitterAddress = splitter.options.address;
   console.log(`QurrlRevenueSplitter ${splitterAddress}`);
+
+  const budget = await deploy(web3, account, 'QurrlBudget', [governance, env.QDAY_ORACLE_ADDRESS || ZERO_ADDRESS]);
+  const budgetAddress = budget.options.address;
+  console.log(`QurrlBudget         ${budgetAddress}`);
+  if (env.TREASURY_ROUTER_ADDRESS) {
+    const splitterContract = contractAt(web3, 'QurrlRevenueSplitter', splitterAddress);
+    await sendRaw(web3, account, { to: splitterAddress, data: splitterContract.methods.setTreasury(env.TREASURY_ROUTER_ADDRESS).encodeABI(), gas: 200_000 });
+    console.log(`   splitter treasury -> ${env.TREASURY_ROUTER_ADDRESS} (ArkTreasuryRouter)`);
+  }
 
   // contracts/core's ArkPhase is not deployed yet; until it is, a stand-in anyone can set.
   let arkPhaseAddress = env.ARK_PHASE_ADDRESS;
@@ -196,7 +211,7 @@ async function main() {
     deployer: account.address,
     deployedAt: new Date().toISOString(),
     collection: { name: NAME, symbol: SYMBOL, maxSupply: 10500, cushionBps: CUSHION_BPS, royaltyBps: ROYALTY_BPS },
-    roles: { creator, governance, minterOwner, acornOracle },
+    roles: { creator, governance, targetGovernance: env.GOVERNANCE_ADDRESS || null, minterOwner, acornOracle },
     arkPhaseStandIn,
     paletteSealed: seal,
     contracts: {
@@ -206,6 +221,7 @@ async function main() {
       QurrlMetadata: metadataAddress,
       QurrlRevenueSplitter: splitterAddress,
       QurrlPhaseMinter: minterAddress,
+      QurrlBudget: budgetAddress,
       ArkPhase: arkPhaseAddress,
     },
   });

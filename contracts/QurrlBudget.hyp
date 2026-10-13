@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkFlow.hyp";
+import "./utils/ArkFlowReceiver.hyp";
+
+/// The ecosystem's Q-Day oracle, read for its protective freeze only.
+interface IBudgetQDay {
+    function frozen() external view returns (bool);
+}
+
+/**
+ * QurrlBudget — Qurrl's Acorn reward budget and season costs, paid by the
+ * Quantum Ark Treasury on the `QURRL_BUDGET` lane (`QuantumArk-Treasury-Flows.md`
+ * §2, §7, adopted 2026-10-13).
+ *
+ * In: anyone may deposit on the lane (IArkFlow rule 3); in practice the
+ * treasury router's `dispatch`, capped per epoch on its side. The lane is not
+ * one-way and not defensive, so it closes during a Q-Day freeze.
+ *
+ * Out: only `payBudget(to, amount)` by governance — the ecosystem timelock,
+ * 14 days, objectable at S1, voted as `TreasurySpend` from S2 (ArkGovTables).
+ * No other function moves QRL.
+ */
+contract QurrlBudget is ArkFlowReceiver, ReentrancyGuard {
+    address public immutable qday;
+    address public governance;
+    address public pendingGovernance;
+
+    event BudgetPaid(address indexed to, uint256 amount);
+    event GovernanceProposed(address indexed proposed);
+    event GovernanceAccepted(address indexed governance);
+
+    error ZeroAddress();
+    error NotGovernance();
+    error NotPending();
+    error InsufficientBudget(uint256 available, uint256 requested);
+    error PayoutFailed(address to, uint256 amount);
+
+    constructor(address governance_, address qday_) {
+        if (governance_ == address(0)) revert ZeroAddress();
+        governance = governance_;
+        qday = qday_;
+    }
+
+    function _lane(bytes32 lane) internal view override returns (LaneInfo memory info) {
+        if (lane == ArkLanes.QURRL_BUDGET) {
+            info.declared = true;
+            info.open = !_frozen();
+            info.room = type(uint256).max;
+        }
+    }
+
+    function payBudget(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != governance) revert NotGovernance();
+        if (to == address(0)) revert ZeroAddress();
+        uint256 available = address(this).balance;
+        if (amount > available) revert InsufficientBudget(available, amount);
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) revert PayoutFailed(to, amount);
+        emit BudgetPaid(to, amount);
+    }
+
+    function proposeGovernance(address next) external {
+        if (msg.sender != governance) revert NotGovernance();
+        if (next == address(0)) revert ZeroAddress();
+        pendingGovernance = next;
+        emit GovernanceProposed(next);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPending();
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(msg.sender);
+    }
+
+    function _frozen() private view returns (bool) {
+        if (qday == address(0)) return false;
+        try IBudgetQDay(qday).frozen() returns (bool f) {
+            return f;
+        } catch {
+            return false;
+        }
+    }
+}

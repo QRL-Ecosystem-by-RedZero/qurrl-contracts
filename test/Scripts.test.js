@@ -25,7 +25,8 @@ test('PHASE_ROWS follow the PhaseRow declaration order of the compiled minter', 
     collection.PHASES.map((p) => p.codename),
     ['Genesis Inventory', 'Lattice Shift', 'Classical Sunset', 'Q-Day', 'Restoration'],
   );
-  assert.equal(collection.GENESIS_MIN_ACORNS, 2001);
+  assert.deepEqual(collection.PHASE0, { direct: 35, top: 45, raffle: 25, raffleFloor: 600, raffleMinTx: 2, perWallet: 1 });
+  assert.equal(collection.PHASE0.direct + collection.PHASE0.top + collection.PHASE0.raffle, collection.PHASES[0].acornCap);
 });
 
 test('the minter constructor accepts the shipped rows and reads them back; its keys are paramKey', async () => {
